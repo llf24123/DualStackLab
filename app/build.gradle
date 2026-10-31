@@ -1,0 +1,52 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.dualstack.lab"
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.dualstack.lab"
+        minSdk 26
+        targetSdk 36
+        versionCode 19
+        versionName "0.6.13"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "androidx.activity:activity:1.10.1"
+    implementation "androidx.swiperefreshlayout:swiperefreshlayout:1.2.0"
+    implementation files("../third_party/termux/terminal-view-8629e632fc-release.aar")
+    implementation project(":terminal-emulator")
+    implementation "com.github.albfernandez:juniversalchardet:2.5.1"
+    implementation "io.github.rosemoe:editor:0.24.6"
+    implementation "io.github.rosemoe:language-java:0.24.6"
+    implementation "io.github.rosemoe:language-textmate:0.24.6"
+    implementation "net.lingala.zip4j:zip4j:2.11.5"
+    implementation "com.github.junrar:junrar:8.1.2"
+    implementation "io.github.reandroid:ARSCLib:1.4.0"
+    implementation "org.smali:baksmali:2.5.2"
+    implementation "org.smali:smali:2.5.2"
+    implementation "com.android.tools.build:apksig:8.9.0"
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
+    testImplementation "junit:junit:4.13.2"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
+    androidTestImplementation "androidx.test.uiautomator:uiautomator:2.3.0"
+}

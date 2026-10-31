@@ -1,0 +1,27 @@
+<resources>
+    <style name="Theme.DualStack" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#167D68</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:statusBarColor">#303030</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#FFFFFF</item>
+    </style>
+    <style name="DirectorySheetAnimation">
+        <item name="android:windowEnterAnimation">@anim/sheet_enter</item>
+        <item name="android:windowExitAnimation">@anim/sheet_exit</item>
+    </style>
+    <style name="Theme.DualStack.Dark" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#72CDB7</item>
+        <item name="android:navigationBarColor">#181B19</item>
+        <item name="android:statusBarColor">#202020</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowBackground">#181B19</item>
+    </style>
+    <style name="NavigationDrawerAnimation">
+        <item name="android:windowEnterAnimation">@anim/drawer_enter</item>
+        <item name="android:windowExitAnimation">@anim/drawer_exit</item>
+    </style>
+</resources>

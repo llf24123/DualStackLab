@@ -1,0 +1,10 @@
+<resources>
+    <color name="ink">#142033</color>
+    <color name="muted">#667085</color>
+    <color name="surface">#F5F7FB</color>
+    <color name="panel">#FFFFFF</color>
+    <color name="line">#D9E0EA</color>
+    <color name="blue">#1677FF</color>
+    <color name="blue_soft">#EAF2FF</color>
+    <color name="danger">#B42318</color>
+</resources>
