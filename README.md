@@ -2,6 +2,8 @@
 
 Android 双窗口文件管理与 APK 学习研究工具。最低 Android 8.0（API 26），目标 API 36。界面参考 MT 管理器的双列表、路径栏和底部操作栏。
 
+应用**不申请 `INTERNET` 权限**：不上传文件、不做统计、没有账号或授权校验，全部功能本地完成。
+
 0.6.13 增加 RAR/RAR5 双窗口浏览、只读文件查看及解压；RAR 内的增删改不提供，需先解压。Junrar 许可见 `third_party/licenses/JUNRAR-LICENSE.txt`，测试样例说明见 `app/src/androidTest/assets/rar-fixtures/README.md`。
 
 ## 已实现
@@ -64,14 +66,21 @@ Android 双窗口文件管理与 APK 学习研究工具。最低 Android 8.0（A
 
 本次验证环境：Windows、JDK 17、系统 Gradle 9.8.1、Android SDK Platform 36、SDK Build Tools 36.1.0、AGP 9.1.1。
 
-项目使用系统 Gradle，没有附带 Gradle Wrapper。依赖首次下载需要联网；仓库地址配置在 `settings.gradle`。
+仓库自带 Gradle Wrapper（`gradlew` / `gradlew.bat`，锁定 Gradle 9.8.1），不需要本机安装 Gradle。依赖首次下载需要联网；仓库地址配置在 `settings.gradle`。
 
-在项目根目录用 PowerShell 执行：
+在项目根目录执行（Windows PowerShell）：
 
 ```powershell
-# 替换为本机的 Android SDK 目录；已经配置时无需重复设置。
+# 替换为本机的 Android SDK 目录；已经配置 ANDROID_HOME 时无需重复设置。
 $env:ANDROID_HOME = 'C:\path\to\Android\Sdk'
-gradle assembleDebug lintDebug
+.\gradlew.bat assembleDebug lintDebug
+```
+
+Linux / macOS：
+
+```bash
+export ANDROID_HOME="$HOME/Android/Sdk"
+./gradlew assembleDebug lintDebug
 ```
 
 也可以在 Android Studio 中打开项目根目录，由 IDE 配置本机 SDK。源码包不包含 `local.properties`。
@@ -163,3 +172,27 @@ gradle connectedDebugAndroidTest
 RAR 读取依赖 Junrar 8.1.2，许可文本保存在 `third_party/licenses/JUNRAR-LICENSE.txt`；归档样例来源和校验用途见 instrumentation assets 的说明。
 
 依赖版本以 `app/build.gradle` 为准，包括 AndroidX Activity、SwipeRefreshLayout、juniversalchardet、Sora Editor、Zip4j、ARSCLib、smali/baksmali、apksig 和 desugar_jdk_libs。Termux 终端基于固定提交 `8629e632fcb95da272221be327db653fb24befe9`：terminal-view 使用未修改 release AAR，terminal-emulator Java 源码在本地 library module 编译，修改 PTY 描述符管理和结束排空顺序，原生库保持上游版本。上游 AAR、完整源码与许可文本保存在 `third_party/termux/`，具体改动见该目录 `NOTICE.md`。原生 64 位 ELF LOAD 段与 APK ZIP 均检查 16 KB 对齐，但尚未在 ARM 16 KB 实机验证。研究、修改或分发依赖时，应保留各项目要求的许可声明。
+
+## 许可证
+
+本项目以 **GNU General Public License v3.0** 发布，全文见 [`LICENSE`](LICENSE)。
+
+选 GPL-3.0 的两个理由：本项目的 `terminal-emulator` 源码派生自 Termux（上游 GPL-3.0-only，两个 terminal 模块为 Apache-2.0 例外），且静态链接了 LGPL-2.1 的 Sora Editor——整体按 GPL-3.0 发布是合规路径最短的一种。若你希望改成 Apache-2.0 或 MIT，需要先评估 LGPL 静态链接与 UnRAR 条款，不要直接替换 `LICENSE` 文件。
+
+## 第三方组件与许可
+
+| 组件 | 版本 | 许可 | 许可文本 |
+|---|---|---|---|
+| AndroidX Activity / SwipeRefreshLayout | 1.10.1 / 1.2.0 | Apache-2.0 | 依赖内 |
+| Termux terminal-view / terminal-emulator | 8629e632fc | Apache-2.0（上游例外条款） | `third_party/termux/Apache-2.0.txt`、`GPL-3.0.txt` |
+| juniversalchardet | 2.5.1 | MPL-1.1 / GPL / LGPL 三选一 | 依赖内 |
+| Sora Editor（editor / language-java / language-textmate） | 0.24.6 | LGPL-2.1 | 依赖内 |
+| zip4j | 2.11.5 | Apache-2.0 | 依赖内 |
+| junrar | 8.1.2 | UnRAR 限制条款 | `third_party/licenses/JUNRAR-LICENSE.txt` |
+| ARSCLib | 1.4.0 | Apache-2.0 | 依赖内 |
+| smali / baksmali | 2.5.2 | BSD-3-Clause | 依赖内 |
+| apksig | 8.9.0 | Apache-2.0 | 依赖内 |
+| desugar_jdk_libs | 2.1.5 | GPL-2.0 with Classpath Exception | 依赖内 |
+
+> junrar 的 UnRAR 条款限制"基于其源码开发 RAR 压缩程序"，与本项目的只读解压用途一致；分发时保留原文即可。
+
