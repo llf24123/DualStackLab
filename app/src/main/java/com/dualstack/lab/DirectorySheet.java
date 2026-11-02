@@ -18,13 +18,15 @@ final class DirectorySheet {
     private final TextView recent, bookmarks, empty;
     private final View recentLine, bookmarkLine;
     private final BaseAdapter adapter;
+    private final SwipeLayout body;
     private boolean showingBookmarks;
+    private boolean closing;
 
     DirectorySheet(Activity activity, DirectoryPlaces places, FileStore.Node current,
                    Consumer<DirectoryPlaces.Entry> navigate) {
         this.activity = activity; this.places = places; this.current = current; this.navigate = navigate;
         dialog = new Dialog(activity); dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        SwipeLayout body = new SwipeLayout(activity, false, dialog::dismiss);
+        body = new SwipeLayout(activity, false, this::close);
         body.setOrientation(LinearLayout.VERTICAL); body.setBackgroundColor(Ui.SURFACE);
         LinearLayout tabs = Ui.row(activity);
         recent = Ui.text(activity, "最近", 17, Ui.MUTED); bookmarks = Ui.text(activity, "书签", 17, Ui.MUTED);
@@ -53,7 +55,7 @@ final class DirectorySheet {
         frame.addView(empty, new FrameLayout.LayoutParams(-1, -1)); list.setEmptyView(empty);
         body.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1)); body.addView(Ui.line(activity));
         LinearLayout footer = Ui.row(activity); footer.setGravity(Gravity.CENTER);
-        footer.addView(Ui.icon(activity, R.drawable.ic_chevron_down, "收起最近与书签", Ui.MUTED, dialog::dismiss), lp(64, 52));
+        footer.addView(Ui.icon(activity, R.drawable.ic_chevron_down, "收起最近与书签", Ui.MUTED, this::close), lp(64, 52));
         body.addView(footer, lp(-1, 52));
         body.canSwipe = () -> !list.canScrollVertically(-1);
         list.setOnItemClickListener((p, v, position, id) -> { dialog.dismiss(); navigate.accept(visible.get(position)); });
@@ -67,14 +69,61 @@ final class DirectorySheet {
         int width = activity.getResources().getDisplayMetrics().widthPixels;
         window.setBackgroundDrawableResource(android.R.color.transparent);
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-        window.setDimAmount(.4f); window.setGravity(Gravity.BOTTOM);
-        window.setWindowAnimations(R.style.DirectorySheetAnimation);
+        // 幕布从 0 淡入，不再让系统在动画开始前就把 0.4 的黑色压上去（那一下就是"闪黑"）
+        window.setDimAmount(0f);
+        window.setGravity(Gravity.BOTTOM);
+        // 关掉系统窗口动画：Dialog 首次 measure 时高度还没稳定，translate 会按错误高度算距离，表现为"跳一下"
+        window.setWindowAnimations(0);
         window.setNavigationBarColor(Ui.SURFACE);
         window.getDecorView().setSystemUiVisibility(Ui.dark ? 0 : View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
-        window.setLayout(-1, Math.round(height * (width > height ? .78f : .54f)));
+        window.setLayout(-1, sheetHeight(width > height ? .78f : .54f));
+        dialog.setOnCancelListener(d -> close());
+        dialog.setOnShowListener(d -> animateIn());
         dialog.show();
     }
-    void dismiss() { dialog.dismiss(); }
+
+    /** 面板高度按"屏幕高 − 导航栏"算，避免底部按钮被手势条压住或悬空。 */
+    private int sheetHeight(float ratio) {
+        int height = activity.getResources().getDisplayMetrics().heightPixels;
+        int bar = 0;
+        int id = activity.getResources().getIdentifier("navigation_bar_height", "dimen", "android");
+        if (id > 0) bar = activity.getResources().getDimensionPixelSize(id);
+        return Math.max(Ui.dp(activity, 240), Math.round((height - bar) * ratio));
+    }
+
+    private void animateIn() {
+        closing = false;
+        Window window = dialog.getWindow();
+        float distance = body.getHeight() > 0 ? body.getHeight() : sheetHeight(.54f);
+        body.setTranslationY(distance);
+        body.animate().translationY(0f).setDuration(220)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator(2f)).start();
+        if (window != null) {
+            android.animation.ValueAnimator dim = android.animation.ValueAnimator.ofFloat(0f, .4f);
+            dim.setDuration(220);
+            dim.addUpdateListener(a -> window.setDimAmount((Float) a.getAnimatedValue()));
+            dim.start();
+        }
+    }
+
+    /** 下滑、收起按钮、点外部、返回键全部走这里，收起动画才和手势一致。 */
+    void close() {
+        if (closing || !dialog.isShowing()) { if (dialog.isShowing()) dialog.dismiss(); return; }
+        closing = true;
+        Window window = dialog.getWindow();
+        float distance = body.getHeight() > 0 ? body.getHeight() : sheetHeight(.54f);
+        body.animate().translationY(distance).setDuration(160)
+                .setInterpolator(new android.view.animation.AccelerateInterpolator(2f))
+                .withEndAction(() -> { try { dialog.dismiss(); } catch (Exception ignored) { } }).start();
+        if (window != null) {
+            android.animation.ValueAnimator dim = android.animation.ValueAnimator.ofFloat(.4f, 0f);
+            dim.setDuration(160);
+            dim.addUpdateListener(a -> window.setDimAmount((Float) a.getAnimatedValue()));
+            dim.start();
+        }
+    }
+
+    void dismiss() { close(); }
     private View tab(TextView label, View underline, boolean bookmark) {
         LinearLayout tab = Ui.column(activity); label.setGravity(Gravity.CENTER);
         tab.addView(label, new LinearLayout.LayoutParams(-1, 0, 1)); tab.addView(underline, lp(-1, 2));

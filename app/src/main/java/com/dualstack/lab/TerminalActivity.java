@@ -213,8 +213,10 @@ public class TerminalActivity extends LabActivity {
         String upstream = "[Process completed" + (exit > 0 ? " (code " + exit + ")" : exit < 0 ? " (signal " + -exit + ")" : "")
                 + " - press Enter]";
         int lines = (upstream.length() - 1) / finished.getEmulator().mColumns;
-        append("\r" + (lines > 0 ? "\u001b[" + lines + "A" : "") + "\u001b[J"
-                + (stopped ? "已停止" : "exit " + exit) + "\r\n\r\n[进程已结束 - 按回车关闭]");
+        String status = stopped ? "已停止" : exitText(exit);
+        String hint = stopped ? "" : exitHint(exit);
+        append("\r" + (lines > 0 ? "\u001b[" + lines + "A" : "") + "\u001b[J" + status
+                + "\r\n" + (hint.isEmpty() ? "" : hint + "\r\n") + "\r\n[进程已结束 - 按回车关闭]");
         String text = terminalText();
         Tasks.IO.execute(() -> {
             try {
@@ -223,6 +225,41 @@ public class TerminalActivity extends LabActivity {
                 handler.post(() -> { if (!disposed && finished == session) outputLog = log; });
             } catch (IOException ignored) { }
         });
+    }
+
+    /** 把 137 这种裸退出码翻译成"哪个信号"。sh 只会打印 Killed，用户看不出是被谁杀的。 */
+    private static String exitText(int status) {
+        if (status == 0) return "exit 0";
+        if (status < 0) return "exit " + status + " · " + signalText(-status);
+        if (status > 128 && status <= 128 + 64) return "exit " + status + " · " + signalText(status - 128);
+        return "exit " + status;
+    }
+
+    private static String signalText(int signal) {
+        String name = switch (signal) {
+            case 1 -> "SIGHUP";
+            case 2 -> "SIGINT";
+            case 3 -> "SIGQUIT";
+            case 6 -> "SIGABRT";
+            case 9 -> "SIGKILL";
+            case 11 -> "SIGSEGV";
+            case 13 -> "SIGPIPE";
+            case 15 -> "SIGTERM";
+            default -> "signal " + signal;
+        };
+        return signal + " " + name;
+    }
+
+    private static String exitHint(int status) {
+        int signal = status < 0 ? -status : status > 128 ? status - 128 : 0;
+        return switch (signal) {
+            case 9 -> "程序被强制杀死（SIGKILL）：常见于程序自身的反调试/反篡改自毁、系统内存或省电策略回收、ROOT 环境校验失败。可试 ROOT 执行并抓 logcat 确认是否被 lowmemorykiller 或 avc 拒绝。";
+            case 11 -> "程序段错误（SIGSEGV）：多为二进制与设备 ABI 或系统库不匹配，或程序自身崩溃。";
+            case 13 -> "管道已关闭（SIGPIPE）：程序仍在向已退出的下游写数据。";
+            case 15 -> "程序被 SIGTERM 正常终止。";
+            case 2 -> "程序被中断（SIGINT）。";
+            default -> "";
+        };
     }
     private void stopSession() {
         TerminalSession current = session;
