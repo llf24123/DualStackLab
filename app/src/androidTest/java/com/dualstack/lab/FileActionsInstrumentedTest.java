@@ -79,6 +79,7 @@ public class FileActionsInstrumentedTest {
         Files.write(new File(directory, "a.bin").toPath(), new byte[]{1, 2, 3});
         Files.write(new File(child, "b.bin").toPath(), new byte[]{4, 5});
         assertTrue(new File(child, "empty.bin").createNewFile());
+        // Statistics are a filesystem question, so they run on ordinary access rather than ROOT-followed listings.
         DirectoryStats.Result result = DirectoryStats.measure(store, FileStore.local(directory), new java.util.concurrent.atomic.AtomicBoolean());
         assertEquals(5, result.bytes()); assertEquals(3, result.files());
         assertEquals(2, result.directories()); assertEquals(0, result.unknownSizeFiles());

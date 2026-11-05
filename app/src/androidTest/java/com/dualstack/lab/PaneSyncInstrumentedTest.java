@@ -115,9 +115,9 @@ public class PaneSyncInstrumentedTest {
             assertTrue(occupied.await(5, TimeUnit.SECONDS));
             scenario.onActivity(activity -> {
                 invoke(pane(activity, true), "navigate", FileStore.directory(data, false));
-                assertEquals("root:" + data.getPath(), get(pane(activity, true), "recordedDirectory"));
+                assertEquals(data.getPath(), plainKey((String) get(pane(activity, true), "recordedDirectory")));
                 invoke(activity, "synchronizeOtherPane");
-                assertEquals("root:" + data.getPath(), get(pane(activity, false), "recordedDirectory"));
+                assertEquals(data.getPath(), plainKey((String) get(pane(activity, false), "recordedDirectory")));
                 assertTrue(((View) get(pane(activity, false), "list")).isEnabled());
             });
         } finally {
@@ -141,7 +141,7 @@ public class PaneSyncInstrumentedTest {
                 for (int i = 0; i < 20; i++) invoke(pane, "navigate", FileStore.directory(i % 2 == 0 ? a : b, false));
                 View list = (View) get(pane, "list");
                 assertEquals(View.VISIBLE, list.getVisibility()); assertFalse(list.isEnabled());
-                assertEquals(left.getPath(), get(pane, "recordedDirectory"));
+                assertEquals(left.getPath(), plainKey((String) get(pane, "recordedDirectory")));
             });
         } finally { release.countDown(); }
         ready(true, b); ready(false, right);
@@ -182,7 +182,8 @@ public class PaneSyncInstrumentedTest {
                 assertEquals(1, nodes.size()); assertEquals("a|b.ini", nodes.get(0).name);
             }
             try { RootDirectoryReader.list(new File(folder, "missing").getPath()); fail("Missing must fail"); }
-            catch (IOException expected) { assertTrue(expected.getMessage().contains("exit")); }
+            catch (IOException expected) { assertTrue(expected.getMessage(), expected.getMessage().contains("not a directory")
+                    || expected.getMessage().contains("已关闭")); }
             RootDirectoryReader.close();
             assertEquals(1, new FileStore(context).list(FileStore.directory(folder, true)).size());
         } finally { workers.shutdownNow(); }
@@ -219,6 +220,7 @@ public class PaneSyncInstrumentedTest {
         device.dumpWindowHierarchy(new File(evidence, name + ".xml"));
     }
     private static Object pane(MainActivity activity, boolean left) { return get(activity, left ? "left" : "right"); }
+    private static String plainKey(String key) { return key.startsWith("root:") ? key.substring(5) : key; }
     private static FileStore.Node node(Object pane) { return (FileStore.Node) get(pane, "location"); }
     private static Object get(Object target, String name) {
         try { Field f = target.getClass().getDeclaredField(name); f.setAccessible(true); return f.get(target); }

@@ -141,7 +141,7 @@ public class InstalledAppsActivity extends LabActivity {
             all.clear(); all.addAll(apps); apply();
             refresh.postDelayed(() -> { if (token == generation) refresh.setRefreshing(false); },
                     Math.max(0, 380 - (SystemClock.uptimeMillis() - started)));
-            list.setAlpha(.65f); list.animate().alpha(1f).setDuration(160).start();
+            list.animate().cancel(); list.setAlpha(1f);
         }, error -> { refresh.setRefreshing(false); empty.setText(error.getMessage()); Tasks.showError(this, error); });
     }
     private void apply() {

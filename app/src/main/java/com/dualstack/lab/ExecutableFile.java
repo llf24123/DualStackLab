@@ -28,10 +28,15 @@ final class ExecutableFile {
                 return "/system/bin/sh -c " + FileStore.quote(". " + FileStore.quote(file.getAbsolutePath()))
                         + " " + FileStore.quote(originalPath);
             }
-            String copy = (root || Build.VERSION.SDK_INT < 29 || elf.needsRoot() ? ""
-                    : elf.bits == 64 ? "/system/bin/linker64 " : "/system/bin/linker ")
-                    + FileStore.quote(file.getAbsolutePath());
-            if (!root) return copy;
+            if (!root) {
+                String staged = FileStore.quote(file.getAbsolutePath());
+                String linker = elf.bits == 64 ? "/system/bin/linker64 " : "/system/bin/linker ";
+                if (elf.needsRoot()) return staged;
+                if (localPath == null) return linker + staged;
+                String original = FileStore.quote(localPath);
+                return "dualstack_run() { if [ -r " + original + " ]; then exec " + linker + original
+                        + " \"$@\"; fi; exec " + linker + staged + " \"$@\"; }; dualstack_run";
+            }
             return FileStore.quote(launcher.getAbsolutePath()) + " "
                     + FileStore.quote(localPath == null ? "" : localPath) + " " + FileStore.quote(file.getAbsolutePath());
         }
@@ -52,6 +57,8 @@ final class ExecutableFile {
         if (node.directory) throw new IOException("请选择 .sh 或 ELF 文件");
         FileStore store = new FileStore(context);
         FileStore.checkName(node.name);
+        if (node.name.toLowerCase(Locale.ROOT).endsWith(".mt"))
+            throw new IOException("不支持执行 .mt 文件，请使用 .sh 脚本或 ELF 程序");
         File folder = Files.createTempDirectory(context.getCodeCacheDir().toPath(), "executable-").toFile();
         File staged = new File(folder, node.name);
         File launcher = null;
@@ -74,7 +81,9 @@ final class ExecutableFile {
                 String primary = Build.SUPPORTED_ABIS[0];
                 boolean sameFamily = primary.startsWith("x86") == info.abi.startsWith("x86");
                 if (!sameFamily || !Arrays.asList(Build.SUPPORTED_ABIS).contains(info.abi))
-                    throw new IOException("ELF 架构 " + info.abi + " 与设备不兼容（" + primary + "）");
+                    throw new IOException("这是 " + info.abi + " 原生 ELF 程序（虽然文件名是 .sh），当前设备 ABI 为 "
+                            + String.join(", ", Build.SUPPORTED_ABIS)
+                            + "，CPU 架构不兼容；请在 arm64-v8a 设备上执行，ROOT 不能转换 CPU 架构");
                 String expected = info.bits == 64 ? "linker64" : "linker";
                 if (!info.interpreter.isEmpty() && !info.interpreter.equals("/system/bin/" + expected)
                         && !info.interpreter.equals("/apex/com.android.runtime/bin/" + expected))

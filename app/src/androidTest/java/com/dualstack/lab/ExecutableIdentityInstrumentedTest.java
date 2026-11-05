@@ -99,6 +99,7 @@ public class ExecutableIdentityInstrumentedTest {
         for (int permissions : List.of(0400, 0500)) {
             File source = probe("exit-" + permissions + ".sh", permissions);
             File counter = new File(work, "counter-" + permissions);
+            Files.write(counter.toPath(), new byte[0]);
             try (ExecutableFile.Prepared prepared = ExecutableFile.prepare(context, FileStore.local(source))) {
                 ShellRunner.Result result = run(prepared, true,
                         " --counter " + FileStore.quote(counter.getAbsolutePath()) + " --exit 126");
@@ -194,8 +195,10 @@ public class ExecutableIdentityInstrumentedTest {
                 UiDevice device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation());
                 device.findObject(By.desc("终端菜单")).click();
                 device.wait(Until.findObject(By.text("执行设置")), 5000).click();
-                device.findObjects(By.clazz("android.widget.EditText")).get(0).setText("--read");
-                device.findObject(By.text("执行")).click();
+                UiObject2 arguments = device.wait(Until.findObject(By.clazz("android.widget.EditText")), 5000);
+                assertNotNull("执行设置 did not open", arguments);
+                arguments.setText("--read");
+                device.wait(Until.findObject(By.text("执行")), 5000).click();
                 output(scenario, "PROBE_INPUT_READY");
                 scenario.onActivity(activity -> {
                     InputConnection input = activity.terminalView().onCreateInputConnection(new EditorInfo());

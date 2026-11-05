@@ -15,13 +15,14 @@ final class RootDirectoryReader {
     private static Session session;
     private static ScheduledFuture<?> idle;
 
-    static synchronized String list(String path) throws IOException {
+    static String list(String path) throws IOException { return list(path, true); }
+    static synchronized String list(String path, boolean followLinks) throws IOException {
         if (idle != null) idle.cancel(false);
         if (session != null && (!session.process.isAlive()
                 || SystemClock.elapsedRealtime() - session.created >= 30000)) close();
         try {
             if (session == null) session = new Session();
-            return session.list(path);
+            return session.list(FileStore.rootListCommand(path, followLinks));
         } catch (IOException e) {
             close(); throw e;
         } finally {
@@ -57,9 +58,9 @@ final class RootDirectoryReader {
             reader.setDaemon(true); reader.start();
         }
 
-        String list(String path) throws IOException {
+        String list(String command) throws IOException {
             String marker = "__DUALSTACK_DIRECTORY_" + UUID.randomUUID() + "_";
-            input.write(FileStore.rootListCommand(path));
+            input.write(command);
             input.write("\nresult=$?\nprintf '\\n" + marker + "%d\\n' \"$result\"\n");
             input.flush();
             long deadline = SystemClock.elapsedRealtime() + 10000;

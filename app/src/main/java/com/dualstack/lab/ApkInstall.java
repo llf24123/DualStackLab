@@ -22,11 +22,15 @@ final class ApkInstall {
         File[] old = folder.listFiles();
         if (old != null) for (File item : old)
             if (System.currentTimeMillis() - item.lastModified() > 86400000) Files.deleteIfExists(item.toPath());
-        File apk = File.createTempFile("shared-", suffix, folder);
-        try (InputStream in = new FileStore(context).read(node); OutputStream out = new FileOutputStream(apk)) {
+        String name = node.name;
+        if (name == null || name.isBlank() || name.contains("/") || name.contains("\\") || name.indexOf('\0') >= 0)
+            name = "shared-file" + suffix;
+        File target = new File(folder, name);
+        if (target.exists()) Files.deleteIfExists(target.toPath());
+        try (InputStream in = new FileStore(context).read(node); OutputStream out = new FileOutputStream(target)) {
             FileStore.pump(in, out);
-        } catch (IOException e) { Files.deleteIfExists(apk.toPath()); throw e; }
-        return apk;
+        } catch (IOException e) { Files.deleteIfExists(target.toPath()); throw e; }
+        return target;
     }
     static Intent normalIntent(Context context, File file) {
         Uri uri = FileProvider.getUriForFile(context, context.getPackageName() + ".files", file);

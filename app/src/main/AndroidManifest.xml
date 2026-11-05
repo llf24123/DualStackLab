@@ -18,6 +18,8 @@
             android:authorities="${applicationId}.files" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/shared_paths" />
         </provider>
+        <activity android:name=".SearchActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
         <activity android:name=".PreviewActivity" android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
         <activity android:name=".InstalledAppsActivity" android:exported="false"

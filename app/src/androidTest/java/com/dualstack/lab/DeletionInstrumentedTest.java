@@ -131,8 +131,10 @@ public class DeletionInstrumentedTest {
         try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
             assertNotNull(device.wait(Until.findObject(By.text("tiny0.ini")), 10000));
             device.findObject(By.desc("更多操作")).click(); device.wait(Until.findObject(By.text("全选")), 5000).click();
-            UiObject2 delete = device.wait(Until.findObject(By.desc("删除")), 5000);
-            assertNotNull("Selection actions did not appear", delete); delete.click();
+            UiObject2 operations = device.wait(Until.findObject(By.desc("操作")), 5000);
+            assertNotNull("Selection actions did not appear", operations); operations.click();
+            UiObject2 delete = device.wait(Until.findObject(By.desc("文件操作 删除")), 5000);
+            assertNotNull("Delete action did not appear", delete); delete.click();
             UiObject2 confirm = device.wait(Until.findObject(By.text("删除")), 5000);
             assertNotNull("Deletion confirmation did not appear", confirm); confirm.click();
             long deadline = SystemClock.uptimeMillis() + 15000;

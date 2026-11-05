@@ -54,9 +54,18 @@ final class FilePermissions {
     static void show(Activity activity, FileStore.Node node, String modified, Runnable changed) {
         LinearLayout body = Ui.column(activity);
         int padding = Ui.dp(activity, 18); body.setPadding(padding, Ui.dp(activity, 6), padding, Ui.dp(activity, 10));
-        TextView info = Ui.text(activity, node.name + "\n" + node.path() + "\n\n"
-                + (node.directory ? "文件夹" : FileStore.size(node.size)) + "\n" + modified, 13, Ui.TEXT);
+        TextView info = Ui.text(activity, node.name, 15, Ui.TEXT);
         info.setTextIsSelectable(true); body.addView(info);
+        TextView path = Ui.text(activity, node.path(), 13, Ui.ACCENT);
+        path.setContentDescription("属性完整路径");
+        path.setPadding(0, Ui.dp(activity, 8), 0, Ui.dp(activity, 8));
+        path.setOnLongClickListener(v -> {
+            ((android.content.ClipboardManager) activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE))
+                    .setPrimaryClip(android.content.ClipData.newPlainText("目录路径", node.path()));
+            Tasks.toast(activity, "路径已复制"); return true;
+        });
+        body.addView(path);
+        body.addView(Ui.text(activity, (node.directory ? "文件夹" : FileStore.size(node.size)) + "\n" + modified, 13, Ui.TEXT));
         TextView stateText = Ui.text(activity, "读取权限…", 12, Ui.MUTED);
         stateText.setPadding(0, Ui.dp(activity, 12), 0, Ui.dp(activity, 8)); body.addView(stateText);
         LinearLayout controls = Ui.column(activity); body.addView(controls);

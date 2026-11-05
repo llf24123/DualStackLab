@@ -150,12 +150,25 @@ public class TerminalActivity extends LabActivity {
             return file;
         }, file -> {
             if (file == null) return;
-            if (file.elf() != null) pipe = false;
+            if (file.elf() != null) {
+                pipe = false;
+                if (!useRoot) useRoot = rootAvailable();
+            }
             preparing = false; runFile();
         }, error -> {
             preparing = false;
-            startSession("printf '%s\\n' " + FileStore.quote("执行失败：" + error.getMessage()) + "; exit 1", "");
+            new AlertDialog.Builder(this).setTitle("无法执行")
+                    .setMessage(error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage())
+                    .setPositiveButton("确定", (dialog, which) -> finish()).setOnDismissListener(dialog -> {
+                        if (!isFinishing()) finish();
+                    }).show();
         });
+    }
+    private boolean rootAvailable() {
+        try {
+            ShellRunner.Result result = new ShellRunner().run("/system/bin/toybox id -u", null, true, 5000, null, false);
+            return result.exitCode() == 0 && result.output().trim().equals("0");
+        } catch (Exception unavailable) { return false; }
     }
     private void runFile() {
         if (preparing || running() || prepared == null) return;
@@ -175,7 +188,7 @@ public class TerminalActivity extends LabActivity {
                     + "cd " + FileStore.quote(cwd) + " || exit\n" + command;
             String launch = useRoot ? "exec " + RootShell.shellCommand(wrapper) : wrapper;
             Map<String, String> env = new LinkedHashMap<>(System.getenv());
-            env.put("PATH", "/system/bin:/system/xbin:/sbin:/debug_ramdisk:" + env.getOrDefault("PATH", ""));
+            env.put("PATH", "/system/bin:/system/xbin:" + env.getOrDefault("PATH", ""));
             env.put("TERM", "xterm-256color"); env.put("COLORTERM", "truecolor"); env.put("LANG", "C.UTF-8");
             String[] environment = env.entrySet().stream().map(e -> e.getKey() + "=" + e.getValue()).toArray(String[]::new);
             stopped = false;

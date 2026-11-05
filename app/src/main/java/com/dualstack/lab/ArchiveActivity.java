@@ -118,7 +118,7 @@ public class ArchiveActivity extends LabActivity {
                 startActivity(i); finish(); return;
             }
             archive = copy;
-            rar = ArchiveOps.isRar(copy);
+            rar = ArchiveOps.isRar(copy) || ArchiveFormats.supported(copy);
             if (rar) {
                 apk.setVisibility(View.GONE); toolButton.setVisibility(View.GONE);
                 commands.getChildAt(0).setVisibility(View.GONE);
@@ -182,7 +182,7 @@ public class ArchiveActivity extends LabActivity {
             if (readSource) {
                 refresh.postDelayed(() -> { if (token == reloadGeneration) refresh.setRefreshing(false); },
                         Math.max(0, 380 - (SystemClock.uptimeMillis() - started)));
-                list.setAlpha(.65f); list.animate().alpha(1f).setDuration(160).start();
+                list.animate().cancel(); list.setAlpha(1f);
             } else refresh.setRefreshing(false);
             items.clear(); items.addAll(found); adapter.notifyDataSetChanged();
             path.setText("/" + prefix); summary.setText(items.size() + " 项 · " + FileStore.size(archive.length()));
@@ -258,7 +258,7 @@ public class ArchiveActivity extends LabActivity {
                 }).show();
     }
     private void newEntry() {
-        if (rar) { Tasks.toast(this, "RAR 当前为只读浏览"); return; }
+        if (rar) { Tasks.toast(this, "此归档格式当前为只读浏览"); return; }
         LinearLayout body = Ui.column(this); EditText name = Ui.input(this, "名称"); body.addView(name);
         CheckBox folder = new CheckBox(this); folder.setText("目录"); body.addView(folder);
         new AlertDialog.Builder(this).setTitle("新建归档条目").setView(body).setNegativeButton("取消", null)
@@ -290,9 +290,8 @@ public class ArchiveActivity extends LabActivity {
                 try {
                     String entry = target == null ? current + imported.name : target;
                     if (target == null) {
-                        try (ZipFile zip = new ZipFile(archive)) {
-                            if (zip.getEntry(entry) != null) throw new IOException("条目已存在，请使用“替换资源”");
-                        }
+                        if (ArchiveOps.containsEntry(archive, entry))
+                    throw new IOException("条目已存在，请使用“替换资源”");
                     }
                     ArchiveOps.rewrite(archive, null, null, Map.of(entry, file)); return true;
                 } finally { Files.deleteIfExists(file.toPath()); }
@@ -309,7 +308,7 @@ public class ArchiveActivity extends LabActivity {
         }
     }
     private <T> void change(Tasks.Job<T> job) {
-        if (rar) { Tasks.toast(this, "RAR 当前为只读浏览"); return; }
+        if (rar) { Tasks.toast(this, "此归档格式当前为只读浏览"); return; }
         if (busy) { Tasks.toast(this, "请等待当前操作"); return; }
         busy = true; refresh.setEnabled(false); summary.setText("处理并写回中…");
         Tasks.run(this, () -> {
@@ -344,7 +343,7 @@ public class ArchiveActivity extends LabActivity {
     }
     private void tool(int n) {
         if (archive == null || busy) { Tasks.toast(this, "等待读取完成"); return; }
-        if (rar) { Tasks.toast(this, "RAR 当前支持浏览、查看和解压"); return; }
+        if (rar) { Tasks.toast(this, "此归档格式支持浏览、查看和解压"); return; }
         if (rawDex && n != 3 && n != 4 && n != 5 && n != 10 && n != 0) { Tasks.toast(this, "此操作需要 APK"); return; }
         switch (n) {
             case 0 -> Tasks.run(this, () -> metadata(), text -> message("文件信息", text));
@@ -380,12 +379,7 @@ public class ArchiveActivity extends LabActivity {
         if (rawDex) { action.run(""); return; }
         Tasks.run(this, () -> {
             List<String> names = new ArrayList<>();
-            try (ZipFile zip = new ZipFile(archive)) {
-                Enumeration<? extends ZipEntry> entries = zip.entries();
-                while (entries.hasMoreElements()) {
-                    String name = entries.nextElement().getName(); if (name.endsWith(".dex")) names.add(name);
-                }
-            }
+            for (String name : ArchiveOps.entryNames(archive)) if (name.endsWith(".dex")) names.add(name);
             Collections.sort(names); return names;
         }, names -> {
             if (names.isEmpty()) { Tasks.toast(this, "没有 DEX 文件"); return; }

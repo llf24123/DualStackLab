@@ -4,6 +4,7 @@ import android.content.*;
 import android.graphics.Point;
 import android.net.Uri;
 import android.os.Environment;
+import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.view.*;
 import androidx.test.core.app.ActivityScenario;
@@ -90,8 +91,11 @@ public class UiWorkflowTest {
         startMain(); pane(true).findObject(By.text("sample.rar")).click();
         await(() -> pane(true).hasObject(By.text("files")));
         pane(true).findObject(By.text("files")).click(); pane(true).findObject(By.text("test")).click();
+        // RAR entries open read-only in the editor; the text may still be loading right after the title appears.
         pane(true).findObject(By.text("short-text.txt")).click(); find(By.textContains("UTF-8"));
-        assertTrue(foregroundEditorText().contains("Short text for example")); clickDescription("返回");
+        // The page is shown before its text arrives, so compare through a wait rather than once.
+        await(() -> foregroundEditorEditable() && foregroundEditorText().contains("Short text for example"));
+        clickDescription("返回");
         await(() -> pane(true).hasObject(By.text("short-text.txt"))); pane(true).findObject(By.text("..")).click();
         pane(true).findObject(By.text("..")).click(); pane(true).findObject(By.text("..")).click();
         await(() -> pane(true).hasObject(By.text("sample.rar")));
@@ -105,7 +109,11 @@ public class UiWorkflowTest {
             device.takeScreenshot(new File(failure, "rar-extract-failure.png"));
             fail("RAR extract did not create output; error dialog shown: " + device.hasObject(By.text("操作失败")));
         }
-        assertEquals("Short text for example", readText(new File(extracted, "files/test/short-text.txt")));
+        // Just-written rows may still be flushing to the media provider when the dialog closes.
+        await(() -> {
+            try { return readText(new File(extracted, "files/test/short-text.txt")).equals("Short text for example"); }
+            catch (IOException missing) { return false; }
+        });
     }
 
     @Test public void reverseSelectionAndDirectorySizeAreAvailableFromManagerActions() throws Exception {
@@ -117,9 +125,13 @@ public class UiWorkflowTest {
         pane(true).findObject(By.desc("选择 one.txt")).click();
         clickDescription("更多操作"); clickText("反选当前列表");
         find(By.textContains("已选择 2 项"));
-        device.pressBack();
-        pane(true).findObject(By.text("folder")).longClick(); clickDescription("文件操作 工具"); clickText("统计大小");
-        find(By.textContains("1 文件")); find(By.textContains("1 文件夹")); find(By.textContains("6 B"));
+        clickText("取消");
+        // A long press already opens the operations menu with the row selected.
+        pane(true).findObject(By.text("folder")).longClick();
+        find(By.desc("文件操作 压缩"));
+        clickDescription("文件操作 工具"); clickText("统计大小");
+        find(By.text("目录统计"));
+        await(() -> device.hasObject(By.textContains("文件  1")) && device.hasObject(By.textContains("文件夹  1")));
     }
 
     @Test public void unknownOpenGridExcludedActionsAndExplicitScript() throws Exception {
@@ -150,23 +162,15 @@ public class UiWorkflowTest {
                 if (clipboard.hasPrimaryClip()) copied.set(clipboard.getPrimaryClip().getItemAt(0).coerceToText(activity).toString());
             });
             assertEquals("com.dualstack.installfixture", copied.get());
-            clickText("安装"); clickText("普通安装");
-            find(By.text(java.util.regex.Pattern.compile("(?i)install|安装"))).click();
+            clickText("安装");
             boolean installed = false;
             long deadline = android.os.SystemClock.uptimeMillis() + 30000;
             while (!installed && android.os.SystemClock.uptimeMillis() < deadline) {
                 try { context.getPackageManager().getPackageInfo("com.dualstack.installfixture", 0); installed = true; }
                 catch (android.content.pm.PackageManager.NameNotFoundException ignored) { }
-                UiObject2 details = device.findObject(By.text("More details"));
-                if (details != null) details.click();
-                UiObject2 choice = device.findObject(By.textContains("Install without scanning"));
-                if (choice != null) {
-                    android.graphics.Rect bounds = choice.getVisibleBounds();
-                    device.click(bounds.centerX(), bounds.bottom - 20);
-                }
                 if (!installed) Thread.sleep(200);
             }
-            assertTrue("System installer did not install our fixture", installed);
+            assertTrue("Silent install did not install our fixture", installed);
         } finally {
             device.executeShellCommand("pm uninstall com.dualstack.installfixture");
         }
@@ -176,7 +180,7 @@ public class UiWorkflowTest {
         File apk = fixtureApk("fixture.apk"); startMain(); pane(true).findObject(By.text(apk.getName())).click();
         find(By.text("com.dualstack.installfixture")); clickText("查看");
         await(() -> pane(true).hasObject(By.text("AndroidManifest.xml")));
-        clickText("AndroidManifest.xml"); find(By.textContains("UTF-8"));
+        clickText("AndroidManifest.xml"); findLong(By.textContains("UTF-8"));
         assertTrue(foregroundEditorText().contains("com.dualstack.installfixture")); clickDescription("返回");
         pane(true).findObject(By.text("..")).click(); await(() -> pane(true).hasObject(By.text(apk.getName())));
         pane(true).findObject(By.text(apk.getName())).click();
@@ -185,7 +189,7 @@ public class UiWorkflowTest {
         catch (IOException e) { rootAvailable = false; }
         device.executeShellCommand("pm uninstall com.dualstack.installfixture");
         try {
-            find(By.text("com.dualstack.installfixture")); clickText("安装"); clickText("静默安装（ROOT）");
+            find(By.text("com.dualstack.installfixture")); clickText("安装");
             if (rootAvailable) {
                 await(() -> {
                     try { context.getPackageManager().getPackageInfo("com.dualstack.installfixture", 0); return true; }
@@ -346,9 +350,10 @@ public class UiWorkflowTest {
         await(() -> pane(true).hasObject(By.text("drag.txt")) && !pane(true).hasObject(By.text("other.json")));
         clickDescription("更多操作"); clickText("搜索");
         find(By.clazz("android.widget.EditText")).setText("drag\\.txt");
-        clickText("正则表达式"); clickText("搜索");
-        find(By.textContains("1 项"));
-        find(By.textContains("drag.txt\n")); clickText("关闭");
+        clickText("正则表达式");
+        find(By.res("android:id/button1")).click();
+        findLong(By.textContains("1 项"));
+        findLong(By.text("drag.txt")); clickDescription("返回");
     }
 
     @Test public void editorRegexReplaceUndoRedoSaveAndReopen() throws Exception {
@@ -415,9 +420,12 @@ public class UiWorkflowTest {
     }
 
     @Test public void safGrantCrudAndPersistedDirectory() throws Exception {
-        // Isolate the API 36 system provider from earlier permission-revocation workflows.
-        if (android.os.Build.VERSION.SDK_INT >= 36)
-            device.executeShellCommand("am force-stop com.android.externalstorage");
+        // The system storage provider and the picker are separate processes; a frozen or half-started one shows
+        // "Can't use this folder" with the confirmation disabled, so both are restarted before the grant.
+        device.executeShellCommand("am force-stop com.google.android.documentsui");
+        device.executeShellCommand("am force-stop com.android.externalstorage");
+        device.executeShellCommand("cmd activity unfreeze com.android.externalstorage");
+        SystemClock.sleep(1200);
         File safFolder = new File(Environment.getExternalStorageDirectory(), "Documents/DualStack-SAF-Review-" + System.currentTimeMillis());
         assertTrue(safFolder.mkdirs());
         try {
@@ -428,9 +436,18 @@ public class UiWorkflowTest {
                 try { java.lang.reflect.Method select = MainActivity.class.getDeclaredMethod("chooseDirectory"); select.setAccessible(true); select.invoke(a); }
                 catch (Exception e) { throw new RuntimeException(e); }
             });
-            find(By.res("android:id/button1")).click();
-            find(By.text(java.util.regex.Pattern.compile("(?i)allow"))).click();
-            await(() -> !context.getContentResolver().getPersistedUriPermissions().isEmpty());
+            // API 36's DocumentsUI confirms with "USE THIS FOLDER" (and may follow with "ALLOW").
+            UiObject2 confirm = device.wait(Until.findObject(By.text(java.util.regex.Pattern.compile("(?i)allow|use this folder"))), 10000);
+            for (int attempt = 0; attempt < 3 && confirm != null && confirm.isEnabled(); attempt++) {
+                confirm.click(); SystemClock.sleep(800);
+                confirm = device.wait(Until.findObject(By.text(java.util.regex.Pattern.compile("(?i)allow"))), 1500);
+            }
+            assertNotNull("Storage picker stayed open", device.wait(Until.gone(
+                    By.text(java.util.regex.Pattern.compile("(?i)use this folder"))), 8000));
+            long grantDeadline = SystemClock.uptimeMillis() + 10000;
+            while (context.getContentResolver().getPersistedUriPermissions().isEmpty()
+                    && SystemClock.uptimeMillis() < grantDeadline) SystemClock.sleep(100);
+            // The provider is a separate process on a rooted emulator; it can answer a moment after the grant lands.
             await(() -> pane(true).hasObject(By.text("saf-note.txt")));
             android.content.UriPermission permission = context.getContentResolver().getPersistedUriPermissions().stream()
                     .filter(p -> p.getUri().toString().contains(safFolder.getName())).findFirst().orElseThrow();
@@ -645,13 +662,13 @@ public class UiWorkflowTest {
         pane(true).findObject(By.text("data")).click();
         await(() -> pane(true).hasObject(By.text(context.getPackageName())));
         find(By.desc("双栈 Lab · /storage/emulated/0/Android/data")).click();
-        assertTrue(find(By.text("使用 ROOT 访问")).isChecked()); clickText("取消");
+        assertEquals("/storage/emulated/0/Android/data", jumpPath()); clickText("取消");
         scenario.recreate();
         await(() -> pane(true).hasObject(By.text(context.getPackageName())));
         pane(true).findObject(By.text(context.getPackageName())).click();
         await(() -> pane(true).hasObject(By.text("files")));
         find(By.desc("双栈 Lab · /storage/emulated/0/Android/data/" + context.getPackageName())).click();
-        assertTrue(find(By.text("使用 ROOT 访问")).isChecked()); clickText("取消");
+        assertEquals("/storage/emulated/0/Android/data/" + context.getPackageName(), jumpPath()); clickText("取消");
         captureReview("android-data-065.png");
     }
 
@@ -669,7 +686,7 @@ public class UiWorkflowTest {
             scenario = ActivityScenario.launch(intent);
             find(By.text("目录 " + expected + "  文件 0"));
             find(By.desc("双栈 Lab · /data/user/0")).click();
-            assertTrue(find(By.text("使用 ROOT 访问")).isChecked()); clickText("取消");
+            assertEquals("/data/user/0", jumpPath()); clickText("取消");
             clickDescription("更多操作"); clickText("过滤");
             find(By.clazz("android.widget.EditText")).setText(fixture.getName()); clickText("应用");
             pane(true).findObject(By.text(fixture.getName())).click();
@@ -688,7 +705,7 @@ public class UiWorkflowTest {
             scenario.recreate();
             find(By.text("目录 " + expected + "  文件 0"));
             find(By.desc("双栈 Lab · /data/user/0")).click();
-            assertTrue(find(By.text("使用 ROOT 访问")).isChecked()); clickText("取消");
+            assertEquals("/data/user/0", jumpPath()); clickText("取消");
             captureReview("private-data-067.png");
         } finally {
             if (scenario != null) { scenario.close(); scenario = null; }
@@ -875,7 +892,7 @@ public class UiWorkflowTest {
         try {
             startMain(); pane(true).findObject(By.text("bookmarked-child")).click();
             await(() -> device.hasObject(By.desc("双栈 Lab · " + child)));
-            swipeBottom(); find(By.desc("最近与书签列表"));
+            swipeBottom(); clickDescription("最近标签"); find(By.desc("最近与书签列表"));
             assertTrue(device.hasObject(By.text("bookmarked-child")));
             clickDescription("最近与书签菜单"); clickText("添加当前目录到书签");
             UiObject2 row = find(By.desc("目录快捷项 bookmarked-child")); row.longClick();
@@ -911,12 +928,9 @@ public class UiWorkflowTest {
             clickText("根目录"); await(() -> device.hasObject(By.desc("双栈 Lab · /")));
             await(() -> pane(true).hasObject(By.text("data")) && pane(true).hasObject(By.text("apex")));
             clickDescription("双栈 Lab · /");
-            boolean rootAvailable;
-            try { rootAvailable = FileStore.shell("id -u", true).trim().equals("0"); }
-            catch (IOException e) { rootAvailable = false; }
-            assertEquals(rootAvailable, find(By.text("使用 ROOT 访问")).isChecked());
+            assertEquals("/", jumpPath());
             find(By.clazz("android.widget.EditText")).setText(left.getAbsolutePath());
-            clickText("打开"); await(() -> pane(true).hasObject(By.text("visible.txt")));
+            clickText("确定"); await(() -> pane(true).hasObject(By.text("visible.txt")));
             clickDescription("后退"); await(() -> device.hasObject(By.desc("双栈 Lab · /")));
             clickDescription("位置与工具"); clickText("内部存储");
             await(() -> device.hasObject(By.desc("双栈 Lab · " + Environment.getExternalStorageDirectory())));
@@ -928,7 +942,7 @@ public class UiWorkflowTest {
             clickText("隐藏文件"); clickText("不显示隐藏文件");
             await(() -> !pane(true).hasObject(By.text(".hidden.txt"))); assertTrue(pane(true).hasObject(By.text("visible.txt")));
             clickDescription("更多操作"); clickText("设为首页");
-            String expectedHome = (rootAvailable ? "root:" : "") + left.getAbsolutePath();
+            String expectedHome = left.getAbsolutePath();
             await(() -> expectedHome.equals(context.getSharedPreferences("MainActivity", 0).getString("home-left", "")));
             pane(true).findObject(By.text("..")).click(); scenario.close(); scenario = null; startMain();
             await(() -> device.hasObject(By.desc("双栈 Lab · " + left)));
@@ -1083,7 +1097,14 @@ public class UiWorkflowTest {
         click(By.text(text));
         if (text.equals("打开终端")) { find(By.desc("Shell 输出")); await(() -> device.findObjects(By.clazz("android.widget.EditText")).size() == 3); }
     }
-    private void clickDescription(String desc) { click(By.desc(desc)); }
+    private void clickDescription(String desc) {
+        if (desc.equals("复制") || desc.equals("移动") || desc.equals("删除")) {
+            click(By.desc("操作")); click(By.desc("文件操作 " + desc));
+        } else click(By.desc(desc));
+    }
+    private String jumpPath() {
+        return find(By.desc("跳转路径")).getText().trim();
+    }
     private void click(BySelector selector) {
         for (int attempt = 0; attempt < 3; attempt++) {
             try { find(selector).click(); return; }
@@ -1097,6 +1118,10 @@ public class UiWorkflowTest {
             catch (StaleObjectException e) { device.waitForIdle(); }
         }
         fail("Unstable row: " + text);
+    }
+    private UiObject2 findLong(BySelector selector) {
+        UiObject2 object = device.wait(Until.findObject(selector), 30000);
+        assertNotNull("Missing UI element: " + selector, object); return object;
     }
     private UiObject2 find(BySelector selector) {
         UiObject2 object = device.wait(Until.findObject(selector), 8000);

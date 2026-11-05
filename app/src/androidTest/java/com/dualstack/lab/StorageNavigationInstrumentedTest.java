@@ -83,8 +83,8 @@ public class StorageNavigationInstrumentedTest {
         launch(null); ready(true, parent); ready(false, parent);
         scenario.recreate(); ready(true, parent); ready(false, parent);
         scenario.close(); scenario = null;
-        assertTrue(context.getSharedPreferences("MainActivity", 0).getString("left", "").endsWith(parent.getPath()));
-        assertTrue(context.getSharedPreferences("MainActivity", 0).getString("right", "").endsWith(parent.getPath()));
+        assertEquals(parent.getPath(), plainKey(context.getSharedPreferences("MainActivity", 0).getString("left", "")));
+        assertEquals(parent.getPath(), plainKey(context.getSharedPreferences("MainActivity", 0).getString("right", "")));
     }
 
     @Test public void savedHomeAndBundleRecoverStorageContainer() throws Exception {
@@ -166,10 +166,13 @@ public class StorageNavigationInstrumentedTest {
         } finally { Files.deleteIfExists(zip.toPath()); }
     }
 
-    @Test public void unreadableDirectoryDoesNotSilentlyRedirect() throws Exception {
-        File deniedDirectory = new File("/data/adb");
-        assertNull(deniedDirectory.listFiles());
-        launch(deniedDirectory.getPath());
+    @Test public void missingDirectoryStaysVisibleInsteadOfRedirecting() throws Exception {
+        // ROOT is the default, so a permissions failure no longer hides the path; a missing one still must show.
+        // A plain file cannot be listed, which ROOT reports as a failure without substituting another path.
+        File missingDirectory = new File(work, "regular-file-" + java.util.UUID.randomUUID());
+        java.nio.file.Files.write(missingDirectory.toPath(), new byte[]{65});
+        assertTrue(missingDirectory.isFile());
+        launch(missingDirectory.getPath());
         long deadline = SystemClock.uptimeMillis() + 10000;
         boolean[] denied = {false};
         while (SystemClock.uptimeMillis() < deadline && !denied[0]) {
@@ -177,17 +180,18 @@ public class StorageNavigationInstrumentedTest {
                 Object pane = pane(activity, true);
                 TextView empty = (TextView) get(pane, "empty");
                 denied[0] = empty.getVisibility() == View.VISIBLE && empty.getText().toString().contains("无法读取");
-                assertEquals(deniedDirectory.getPath(), node(pane).path());
-                assertFalse(node(pane).root);
+                assertEquals(missingDirectory.getPath(), node(pane).path());
             });
             SystemClock.sleep(40);
         }
-        assertTrue("A genuine permission failure must remain visible", denied[0]);
+        assertTrue("A missing directory must remain visible", denied[0]);
         scenario.onActivity(activity -> activity.onNewIntent(
                 new Intent(activity, MainActivity.class).putExtra("navigatePath", home.getPath())));
         ready(true, home);
     }
 
+    /** Saved keys drop the ROOT mark; older builds may still carry it. */
+    private static String plainKey(String key) { return key.startsWith("root:") ? key.substring(5) : key; }
     private void permission(boolean granted) throws Exception {
         device.executeShellCommand("cmd appops set " + context.getPackageName()
                 + " MANAGE_EXTERNAL_STORAGE " + (granted ? "allow" : "deny"));

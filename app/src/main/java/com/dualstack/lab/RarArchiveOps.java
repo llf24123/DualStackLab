@@ -46,6 +46,26 @@ final class RarArchiveOps {
         return result;
     }
 
+    static long entrySize(File file, String entry) throws IOException {
+        try (Archive archive = open(file)) {
+            for (FileHeader header : archive.getFileHeaders()) {
+                if (normalize(header.getFileName()).equals(entry)) return header.isDirectory() ? 0 : header.getFullUnpackSize();
+            }
+        } catch (Exception error) {
+            throw io("无法读取 RAR 条目", error);
+        }
+        return -1;
+    }
+
+    static List<String> entryNames(File file) throws IOException {
+        List<String> names = new ArrayList<>();
+        try (Archive archive = open(file)) {
+            for (FileHeader header : archive.getFileHeaders()) names.add(normalize(header.getFileName()));
+        } catch (Exception error) {
+            throw io("无法读取 RAR 目录", error);
+        }
+        return names;
+    }
     static InputStream openEntry(File file, String entry) throws IOException {
         Archive archive = open(file);
         try {
@@ -66,6 +86,7 @@ final class RarArchiveOps {
             throw io("无法读取 RAR 条目", error);
         }
     }
+
 
     static void extract(File file, String prefix, File output, boolean selected) throws IOException {
         if (!output.isDirectory() && !output.mkdirs()) throw new IOException("无法创建输出目录");

@@ -2,6 +2,7 @@ package com.dualstack.lab;
 
 import android.app.*;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.view.*;
 import android.widget.*;
 import java.util.*;
@@ -12,7 +13,11 @@ final class DirectorySheet {
     private final DirectoryPlaces places;
     private final FileStore.Node current;
     private final Consumer<DirectoryPlaces.Entry> navigate;
-    private final Dialog dialog;
+    private final FrameLayout overlay;
+    private final View scrim;
+    private final SwipeLayout body;
+    private int dialogHeight;
+    private ViewGroup host;
     private final List<DirectoryPlaces.Entry> visible = new ArrayList<>();
     private final ListView list;
     private final TextView recent, bookmarks, empty;
@@ -23,8 +28,17 @@ final class DirectorySheet {
     DirectorySheet(Activity activity, DirectoryPlaces places, FileStore.Node current,
                    Consumer<DirectoryPlaces.Entry> navigate) {
         this.activity = activity; this.places = places; this.current = current; this.navigate = navigate;
-        dialog = new Dialog(activity); dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        SwipeLayout body = new SwipeLayout(activity, false, dialog::dismiss);
+        overlay = new FrameLayout(activity);
+        overlay.setContentDescription("最近与书签面板");
+        overlay.setOnApplyWindowInsetsListener((view, insets) -> { resize(); return insets; });
+        overlay.addOnLayoutChangeListener((view, l, t, r, b, oldL, oldT, oldR, oldB) -> resize());
+        scrim = new View(activity); scrim.setBackgroundColor(0x66000000);
+        scrim.setOnClickListener(v -> dismiss());
+        overlay.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+        showingBookmarks = true;
+        body = new SwipeLayout(activity, false, this::dismiss);
+        body.setDragCallbacks(() -> body.animate().cancel(),
+                this::position, commit -> settle(!commit));
         body.setOrientation(LinearLayout.VERTICAL); body.setBackgroundColor(Ui.SURFACE);
         LinearLayout tabs = Ui.row(activity);
         recent = Ui.text(activity, "最近", 17, Ui.MUTED); bookmarks = Ui.text(activity, "书签", 17, Ui.MUTED);
@@ -51,30 +65,111 @@ final class DirectorySheet {
         list.setAdapter(adapter); frame.addView(list, new FrameLayout.LayoutParams(-1, -1));
         empty = Ui.text(activity, "", 14, Ui.MUTED); empty.setGravity(Gravity.CENTER);
         frame.addView(empty, new FrameLayout.LayoutParams(-1, -1)); list.setEmptyView(empty);
-        body.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1)); body.addView(Ui.line(activity));
+        body.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1));
+        body.addView(Ui.line(activity));
         LinearLayout footer = Ui.row(activity); footer.setGravity(Gravity.CENTER);
-        footer.addView(Ui.icon(activity, R.drawable.ic_chevron_down, "收起最近与书签", Ui.MUTED, dialog::dismiss), lp(64, 52));
+        footer.addView(Ui.icon(activity, R.drawable.ic_chevron_down, "收起最近与书签", Ui.MUTED, this::dismiss), lp(64, 52));
         body.addView(footer, lp(-1, 52));
+        body.setClipToPadding(false); body.setClipChildren(false);
+        body.persistentInsets = true;
+        body.setPadding(0, 0, 0, safeBottom());
         body.canSwipe = () -> !list.canScrollVertically(-1);
-        list.setOnItemClickListener((p, v, position, id) -> { dialog.dismiss(); navigate.accept(visible.get(position)); });
+        list.setOnItemClickListener((p, v, position, id) -> { dismiss(); navigate.accept(visible.get(position)); });
         list.setOnItemLongClickListener((p, v, position, id) -> { entryMenu(visible.get(position)); return true; });
-        dialog.setContentView(body); update();
+        update();
     }
-    void show() {
-        Window window = dialog.getWindow();
-        if (window == null) return;
-        int height = activity.getResources().getDisplayMetrics().heightPixels;
-        int width = activity.getResources().getDisplayMetrics().widthPixels;
-        window.setBackgroundDrawableResource(android.R.color.transparent);
-        window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-        window.setDimAmount(.4f); window.setGravity(Gravity.BOTTOM);
-        window.setWindowAnimations(R.style.DirectorySheetAnimation);
-        window.setNavigationBarColor(Ui.SURFACE);
-        window.getDecorView().setSystemUiVisibility(Ui.dark ? 0 : View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
-        window.setLayout(-1, Math.round(height * (width > height ? .78f : .54f)));
-        dialog.show();
+    void show() { show(false); settle(true); }
+    void showForDrag() { show(true); }
+    private void show(boolean startHidden) {
+        if (isShowing()) return;
+        host = activity.findViewById(android.R.id.content);
+        overlay.addView(body, new FrameLayout.LayoutParams(1, 1, Gravity.BOTTOM | Gravity.LEFT));
+        host.addView(overlay, new ViewGroup.LayoutParams(-1, -1));
+        resize();
+        body.setElevation(Ui.dp(activity, 8));
+        position(startHidden ? dialogHeight : 0);
+        overlay.requestApplyInsets();
     }
-    void dismiss() { dialog.dismiss(); }
+    private int safeBottom() {
+        WindowInsets insets = activity.getWindow().getDecorView().getRootWindowInsets();
+        if (insets == null) return 0;
+        return android.os.Build.VERSION.SDK_INT >= 30
+                ? insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()).bottom
+                : insets.getSystemWindowInsetBottom();
+    }
+
+    private void resize() {
+        if (host == null || host.getWidth() == 0 || host.getHeight() == 0) return;
+        Rect insets = safeInsets();
+        float density = activity.getResources().getDisplayMetrics().density;
+        Rect bounds = panelBounds(host.getWidth(), host.getHeight(), insets, density);
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) body.getLayoutParams();
+        int bottom = host.getHeight() - bounds.bottom;
+        int padding = safeBottom();
+        if (params.width == bounds.width() && params.height == bounds.height()
+                && params.leftMargin == bounds.left && params.bottomMargin == bottom
+                && body.getPaddingBottom() == padding) return;
+        float fraction = dialogHeight == 0 ? 0 : body.getTranslationY() / dialogHeight;
+        body.animate().cancel(); scrim.animate().cancel();
+        dialogHeight = bounds.height();
+        params.width = bounds.width(); params.height = bounds.height();
+        params.leftMargin = bounds.left; params.bottomMargin = bottom;
+        body.setLayoutParams(params);
+        // The drawer reaches the screen edge; its content keeps clear of the navigation bar.
+        body.setPadding(0, 0, 0, padding);
+        // ListView ends at the drawer's bottom padding; keep its last row above that band.
+        list.setClipToPadding(false);
+        body.requestLayout();
+        position(dialogHeight * fraction);
+    }
+    private Rect safeInsets() {
+        WindowInsets insets = host.getRootWindowInsets();
+        if (insets == null) return new Rect();
+        int left, top, right, bottom;
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars()
+                    | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
+            left = bars.left; top = bars.top; right = bars.right; bottom = bars.bottom;
+        } else {
+            left = insets.getSystemWindowInsetLeft(); top = insets.getSystemWindowInsetTop();
+            right = insets.getSystemWindowInsetRight(); bottom = insets.getSystemWindowInsetBottom();
+        }
+        int[] xy = new int[2]; host.getLocationInWindow(xy);
+        View decor = activity.getWindow().getDecorView();
+        // Insets are window-relative; content may already exclude a system bar on older Android versions.
+        return new Rect(Math.max(0, left - xy[0]), Math.max(0, top - xy[1]),
+                Math.max(0, xy[0] + host.getWidth() - (decor.getWidth() - right)),
+                Math.max(0, xy[1] + host.getHeight() - (decor.getHeight() - bottom)));
+    }
+    static Rect panelBounds(int width, int height, Rect insets, float density) {
+        int availableWidth = Math.max(1, width - insets.left - insets.right);
+        int availableHeight = Math.max(1, height - insets.top - insets.bottom);
+        // Phones and tablets use the same full-width drawer; it meets the screen edge and pads its content.
+        int drawerHeight = Math.min(availableHeight,
+                Math.max(Math.round(200 * density), Math.round(availableHeight * .54f)));
+        int top = height - drawerHeight;
+        return new Rect(insets.left, top, insets.left + availableWidth, height);
+    }
+    boolean isShowing() { return overlay.getParent() != null; }
+    private void position(float offset) {
+        body.setTranslationY(Math.max(0, Math.min(dialogHeight, offset)));
+        scrim.setAlpha(1f - body.getTranslationY() / Math.max(1, dialogHeight));
+    }
+    void drag(float distance) { position(dialogHeight - distance); }
+    void finishDrag(boolean commit) { settle(commit); }
+    private void settle(boolean open) {
+        body.animate().cancel(); scrim.animate().cancel();
+        body.animate().translationY(open ? 0 : dialogHeight).setDuration(150)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                .withEndAction(open ? null : this::dismiss).start();
+        scrim.animate().alpha(open ? 1 : 0).setDuration(150).start();
+    }
+    void dismiss() {
+        body.animate().cancel(); scrim.animate().cancel();
+        if (overlay.getParent() instanceof ViewGroup parent) parent.removeView(overlay);
+        overlay.removeView(body); host = null;
+    }
+
     private View tab(TextView label, View underline, boolean bookmark) {
         LinearLayout tab = Ui.column(activity); label.setGravity(Gravity.CENTER);
         tab.addView(label, new LinearLayout.LayoutParams(-1, 0, 1)); tab.addView(underline, lp(-1, 2));
@@ -149,32 +244,61 @@ final class DirectorySheet {
         private final int slop;
         private float x, y;
         private boolean swiping;
+        /** The drawer supplies its own bottom padding, so the system must not add it again. */
+        boolean persistentInsets;
+        private Runnable dragStart;
+        private Consumer<Float> dragProgress;
+        private Consumer<Boolean> dragEnd;
         java.util.function.BooleanSupplier canSwipe = () -> true;
         SwipeLayout(android.content.Context context, boolean upward, Runnable action) {
             super(context); this.upward = upward; this.action = action;
             setClickable(true);
-            slop = ViewConfiguration.get(context).getScaledTouchSlop() * 2;
+            slop = ViewConfiguration.get(context).getScaledTouchSlop();
+        }
+        void setDragCallbacks(Runnable start, Consumer<Float> progress, Consumer<Boolean> end) {
+            dragStart = start; dragProgress = progress; dragEnd = end;
+        }
+        @Override public WindowInsets onApplyWindowInsets(WindowInsets insets) {
+            return persistentInsets ? insets : super.onApplyWindowInsets(insets);
+        }
+        private void begin(MotionEvent event) {
+            animate().cancel(); x = event.getRawX(); y = event.getRawY(); swiping = false;
+        }
+        private boolean track(MotionEvent event) {
+            float dy = event.getRawY() - y;
+            if (!swiping && (upward ? -dy : dy) > slop
+                    && Math.abs(dy) > Math.abs(event.getRawX() - x) * 1.5f && canSwipe.getAsBoolean()) {
+                swiping = true;
+                getParent().requestDisallowInterceptTouchEvent(true);
+                if (dragStart != null) dragStart.run();
+            }
+            return swiping;
         }
         @Override public boolean onInterceptTouchEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) { x = event.getX(); y = event.getY(); swiping = false; }
-            if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
-                float dy = event.getY() - y;
-                if ((upward ? -dy : dy) > slop && Math.abs(dy) > Math.abs(event.getX() - x) * 1.5f && canSwipe.getAsBoolean()) {
-                    swiping = true; return true;
-                }
-            }
-            return false;
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) begin(event);
+            return event.getActionMasked() == MotionEvent.ACTION_MOVE && track(event);
         }
         @Override public boolean onTouchEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) { x = event.getX(); y = event.getY(); swiping = false; return true; }
-            if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
-                float dy = event.getY() - y;
-                if ((upward ? -dy : dy) > slop && Math.abs(dy) > Math.abs(event.getX() - x) * 1.5f && canSwipe.getAsBoolean()) swiping = true;
+            int type = event.getActionMasked();
+            if (type == MotionEvent.ACTION_DOWN) { begin(event); return true; }
+            if (type == MotionEvent.ACTION_MOVE && track(event)) {
+                float distance = Math.max(0, upward ? y - event.getRawY() : event.getRawY() - y);
+                if (dragProgress != null) dragProgress.accept(distance);
+                else setTranslationY((upward ? -1 : 1) * distance);
+                return true;
             }
             if (!swiping) return super.onTouchEvent(event);
-            if (event.getActionMasked() == MotionEvent.ACTION_UP) { swiping = false; action.run(); }
-            if (event.getActionMasked() == MotionEvent.ACTION_CANCEL) swiping = false;
+            if (type == MotionEvent.ACTION_UP || type == MotionEvent.ACTION_CANCEL || type == MotionEvent.ACTION_POINTER_DOWN) {
+                float distance = Math.max(0, upward ? y - event.getRawY() : event.getRawY() - y);
+                boolean commit = type == MotionEvent.ACTION_UP && distance >= Ui.dp(getContext(), 48);
+                swiping = false;
+                getParent().requestDisallowInterceptTouchEvent(false);
+                if (dragEnd != null) dragEnd.accept(commit);
+                else if (commit) action.run();
+                else animate().translationY(0).setDuration(150).start();
+            }
             return true;
         }
     }
+
 }

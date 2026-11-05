@@ -41,7 +41,7 @@ public class DirectoryPerformanceInstrumentedTest {
             List<Long> enumeration = new ArrayList<>();
             for (int i = 0; i < 12; i++) {
                 long start = SystemClock.elapsedRealtimeNanos();
-                assertEquals(1201, store.list(FileStore.directory(folder, false)).size());
+                assertEquals("panes default to ROOT listings", 1201, store.list(FileStore.directory(folder, false)).size());
                 enumeration.add(SystemClock.elapsedRealtimeNanos() - start);
             }
             result.put("rootEnumeration", summary(enumeration));

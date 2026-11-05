@@ -86,7 +86,7 @@ public class InteractionInstrumentedTest {
         assertTrue(device.wait(Until.findObject(By.desc("右窗口文件列表")), 5000) != null);
         long end = SystemClock.uptimeMillis() + 10000;
         awaitContents(new File(right, "note.txt"), "COPY_OK");
-        assertTrue(device.wait(Until.gone(By.desc("清选")), 5000));
+        assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
         assertEquals("COPY_OK", new String(Files.readAllBytes(new File(right, "note.txt").toPath())));
         find(By.desc("左窗口文件列表")).findObject(By.text("note.txt")).longClick();
         find(By.desc("文件操作 重命名")).click(); find(By.clazz(android.widget.EditText.class)).setText("renamed.txt");
@@ -207,7 +207,7 @@ public class InteractionInstrumentedTest {
         assertTrue(find(By.desc("文件操作 分享")).isEnabled()); find(By.desc("文件操作 移动")).click();
         deadline = SystemClock.uptimeMillis() + 10000;
         awaitContents(new File(right, "two.txt"), "two");
-        assertTrue(device.wait(Until.gone(By.desc("清选")), 5000));
+        assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
         assertEquals("two", new String(Files.readAllBytes(new File(right, "two.txt").toPath())));
         assertFalse(new File(left, "one.txt").exists()); assertFalse(new File(left, "two.txt").exists());
     }
@@ -222,13 +222,13 @@ public class InteractionInstrumentedTest {
         File folder = new File(left, "folder"); assertTrue(folder.mkdir());
         Files.write(new File(folder, "child.txt").toPath(), "child".getBytes());
         main(); find(By.text("one.txt")); swipeRow(true, "folder", true);
-        find(By.desc("复制")); assertTrue(device.hasObject(By.text("one.txt")));
+        find(By.desc("操作")); assertTrue(device.hasObject(By.text("one.txt")));
         swipeRow(true, "one.txt", false); find(By.textContains("已选择 2 项"));
-        find(By.desc("复制")).click();
+        find(By.desc("操作")).click(); find(By.desc("文件操作 复制")).click();
         awaitContents(new File(right, "one.txt"), "one"); awaitContents(new File(right, "folder/child.txt"), "child");
-        assertTrue(device.wait(Until.gone(By.desc("清选")), 5000));
-        swipeRow(false, "one.txt", true); find(By.desc("清选"));
-        swipeRow(false, "one.txt", false); assertTrue(device.wait(Until.gone(By.desc("清选")), 5000));
+        assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
+        swipeRow(false, "one.txt", true); find(By.desc("取消"));
+        swipeRow(false, "one.txt", false); assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
     }
     @Test public void horizontalThenVerticalStrokeSelectsRangeAndCanClearIt() throws Exception {
         for (int i = 0; i < 3; i++) Files.write(new File(left, "row-" + i + ".txt").toPath(), ("row" + i).getBytes());
@@ -245,7 +245,7 @@ public class InteractionInstrumentedTest {
                 assertTrue(find(By.textContains("已选择 ")).getText(),
                         device.hasObject(By.textContains("已选择 3 项")));
             }
-            else assertTrue(device.wait(Until.gone(By.desc("清选")), 5000));
+            else assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
         }
         find(By.text("row-0.txt")).click(); find(By.desc("保存"));
     }
@@ -287,10 +287,10 @@ public class InteractionInstrumentedTest {
     @Test public void verticalScrollAndParentRowSwipeDoNotSelectFiles() throws Exception {
         for (int i = 0; i < 80; i++) Files.write(new File(left, String.format("vertical-%03d.txt", i)).toPath(), new byte[]{65});
         main(); find(By.text("vertical-000.txt")); swipeRow(true, "..", true);
-        assertFalse(device.hasObject(By.desc("清选")));
+        assertFalse(device.hasObject(By.desc("取消")));
         android.graphics.Rect bounds = find(By.desc("左窗口文件列表")).getVisibleBounds();
         assertTrue(device.swipe(bounds.centerX(), bounds.bottom - 120, bounds.centerX(), bounds.top + 100, 35));
-        assertFalse(device.hasObject(By.desc("清选")));
+        assertFalse(device.hasObject(By.desc("取消")));
         capture("vertical-scroll-066");
         scenario.onActivity(a -> {
             SwipeSelectListView list = descendant(a.getWindow().getDecorView(), SwipeSelectListView.class);
@@ -315,8 +315,8 @@ public class InteractionInstrumentedTest {
         assertTrue(selected, count.find());
         assertTrue("Selection did not scroll past " + initiallyVisible + " rows: " + selected,
                 Integer.parseInt(count.group(1)) > initiallyVisible);
-        capture("swipe-range-autoscroll"); find(By.desc("清选")).click();
-        assertTrue(device.wait(Until.gone(By.desc("清选")), 5000));
+        capture("swipe-range-autoscroll"); find(By.desc("取消")).click();
+        assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
     }
     @Test public void fileActionsFollowDarkThemeAndFitLandscape() throws Exception {
         Files.write(new File(left, "theme.txt").toPath(), "theme".getBytes());

@@ -146,7 +146,7 @@ public class CoreInstrumentedTest {
         assertTrue(result.stream().anyMatch(n -> n.name.equals("linked") && n.directory && n.root));
         assertTrue(result.stream().anyMatch(n -> n.name.equals("broken") && !n.directory && n.root));
         assertTrue(result.stream().anyMatch(n -> n.name.equals("pipe|name.txt") && n.size == 9 && !n.directory));
-        assertFalse(RootAccess.directory(directory, false).root);
+        assertTrue("ROOT is the default for filesystem panes", RootAccess.directory(directory, false).root);
     }
 
     @Test public void rootNamespaceOptionsPreserveCommandsAndProtectPrivateContainers() {

@@ -146,25 +146,41 @@ final class FileStore {
         out.sort((a, b) -> a.directory != b.directory ? (a.directory ? -1 : 1) : a.name.compareToIgnoreCase(b.name));
         return out;
     }
-    static String rootListCommand(String path) {
-        // Keep batch stat fast; dangling links must not reject the entire directory.
-        String batch = "if ! /system/bin/toybox stat -L -c '%f|%s|%Y|%n' \"$@\" 2>/dev/null; then "
+    static String rootListCommand(String path) { return rootListCommand(path, true); }
+    static String rootListCommand(String path, boolean followLinks) {
+        String stat = "/system/bin/toybox stat " + (followLinks ? "-L " : "") + "-c '%f|%s|%Y|%n' \"$@\"";
+        String batch = followLinks ? "if ! " + stat + " 2>/dev/null; then "
                 + "for entry do if [ -L \"$entry\" ] && [ ! -e \"$entry\" ]; then "
-                + "/system/bin/toybox stat -c '%f|%s|%Y|%n' \"$entry\" 2>/dev/null; fi; done; fi; exit 0";
-        return "/system/bin/toybox find -H " + quote(path)
-                + " -mindepth 1 -maxdepth 1 -exec /system/bin/sh -c " + quote(batch) + " sh {} +";
+                + "/system/bin/toybox stat -c '%f|%s|%Y|%n' \"$entry\" 2>/dev/null; fi; done; fi; exit 0" : stat;
+        String quoted = quote(path);
+        // Do not exit the persistent reader shell on a bad path, and never interpolate a path into shell code.
+        return "if [ -d " + quoted + " ]; then /system/bin/toybox find -H " + quoted
+                + " -mindepth 1 -maxdepth 1 -exec /system/bin/sh -c " + quote(batch) + " sh {} +; else "
+                + "printf '%s\\n' " + quote("not a directory: " + path) + " >&2; false; fi";
     }
-    static List<Node> parseRootListing(String output) throws IOException {
+    List<Node> listForStats(Node requested) throws IOException {
+        Node node = RootAccess.automatic(requested);
+        if (node.file == null) return list(node);
+        if (node.root) return parseRootListing(RootDirectoryReader.list(node.path(), false), true);
+        List<Node> children = new ArrayList<>();
+        try (java.nio.file.DirectoryStream<java.nio.file.Path> stream = Files.newDirectoryStream(node.file.toPath())) {
+            for (java.nio.file.Path entry : stream) if (!Files.isSymbolicLink(entry)) children.add(local(entry.toFile()));
+        }
+        return children;
+    }
+    static List<Node> parseRootListing(String output) throws IOException { return parseRootListing(output, false); }
+    private static List<Node> parseRootListing(String output, boolean skipLinks) throws IOException {
         List<Node> out = new ArrayList<>();
         for (String line : output.split("\n")) {
-                String[] fields = line.split("\\|", 4);
-                if (fields.length != 4) continue;
-                try {
-                    int mode = Integer.parseInt(fields[0], 16);
-                    File f = new File(fields[3]);
-                    out.add(new Node(f.getName(), f, null, (mode & 0xf000) == 0x4000,
-                            true, Long.parseLong(fields[1]), Long.parseLong(fields[2]) * 1000));
-                } catch (NumberFormatException e) { throw new IOException("ROOT 目录解析失败", e); }
+            String[] fields = line.split("\\|", 4);
+            if (fields.length != 4) continue;
+            try {
+                int mode = Integer.parseInt(fields[0], 16);
+                if (skipLinks && (mode & 0xf000) == 0xa000) continue;
+                File f = new File(fields[3]);
+                out.add(new Node(f.getName(), f, null, (mode & 0xf000) == 0x4000,
+                        true, Long.parseLong(fields[1]), Long.parseLong(fields[2]) * 1000));
+            } catch (NumberFormatException e) { throw new IOException("ROOT 目录解析失败", e); }
         }
         return out;
     }
@@ -210,10 +226,7 @@ final class FileStore {
                 pump(in, out);
             }
         } else if (node.root) {
-            String tmp = node.path() + ".dualstack-" + UUID.randomUUID();
-            Process p = RootShell.command(rootWriteCommand(node.path(), tmp)).start();
-            try (OutputStream out = p.getOutputStream(); InputStream in = new FileInputStream(content)) { pump(in, out); }
-            await(p);
+            applyRoot(content, node);
         } else {
             File tmp = File.createTempFile(".dualstack-", ".tmp", node.file.getParentFile());
             try {
@@ -222,6 +235,19 @@ final class FileStore {
             } finally { Files.deleteIfExists(tmp.toPath()); }
         }
     }
+    /** Publish only a complete payload, preserving the original mode and owner. */
+    private void applyRoot(File staged, Node node) throws IOException {
+        String temporary = node.path() + ".dualstack-" + UUID.randomUUID();
+        String command = rootWriteCommand(node.path(), temporary, staged.length());
+        try (InputStream input = new FileInputStream(staged)) {
+            ShellRunner.Result result = new ShellRunner().run(command, null, true, 300000, null, true, input);
+            if (result.timedOut()) throw new IOException("ROOT 写入超时");
+            if (result.exitCode() != 0) throw new IOException("ROOT 写入失败\n" + result.output());
+        } finally {
+            shell("/system/bin/toybox rm -f -- " + quote(temporary), true);
+        }
+    }
+
     Node create(Node parent, String name, boolean directory) throws IOException {
         parent = RootAccess.automatic(parent);
         checkName(name);
@@ -240,7 +266,11 @@ final class FileStore {
         }
         File f = new File(parent.file, name);
         if (parent.root) {
-            shell((directory ? "mkdir " : "touch ") + quote(f.getAbsolutePath()), true);
+            String path = quote(f.getAbsolutePath()), container = quote(parent.file.getAbsolutePath());
+            // Inherit the parent's owner so FUSE-visible entries stay owned by the storage user, not ROOT.
+            shell((directory ? "mkdir " : "touch ") + path + " || exit 1;"
+                    + " owner=$(/system/bin/toybox stat -c '%u:%g' " + container + " 2>/dev/null);"
+                    + " [ -n \"$owner\" ] && /system/bin/toybox chown \"$owner\" " + path + " 2>/dev/null; exit 0", true);
             return new Node(name, f, null, directory, true, 0, System.currentTimeMillis());
         }
         if (!(directory ? f.mkdir() : f.createNewFile())) throw new IOException("无法创建 " + name);
@@ -295,10 +325,12 @@ final class FileStore {
         Map<String, Node> roots = new LinkedHashMap<>();
         Map<String, List<Node>> archives = new LinkedHashMap<>();
         List<Node> ordinary = new ArrayList<>();
+        List<Node> localFiles = new ArrayList<>();
         for (Node original : requested) {
             Node node = RootAccess.automatic(original);
             if (node.container != null) archives.computeIfAbsent(node.container.key(), key -> new ArrayList<>()).add(node);
             else if (node.root) roots.put(node.path(), node);
+            else if (node.file != null && !node.directory) localFiles.add(node);
             else ordinary.add(node);
         }
         String prefix = "/system/bin/toybox rm -rf --";
@@ -336,7 +368,21 @@ final class FileStore {
                 } finally { release(source, archive); }
             }
         }
+        for (Node node : localFiles) Files.deleteIfExists(node.file.toPath());
         for (Node node : ordinary) delete(node);
+    }
+    /** Resolves a path outside the app's ordinary view of the filesystem; falls back to the plain path. */
+    static String physical(File file) {
+        String fallback;
+        try { fallback = file.getCanonicalPath(); }
+        catch (IOException ignored) { fallback = file.getAbsolutePath(); }
+        if (!RootAccess.known()) return fallback;
+        try {
+            ShellRunner.Result result = new ShellRunner().run("/system/bin/toybox realpath "
+                    + quote(file.getAbsolutePath()), null, true, 5000, null, false);
+            if (!result.timedOut() && result.exitCode() == 0 && !result.output().isBlank()) return result.output().trim();
+        } catch (IOException ignored) { }
+        return fallback;
     }
     private static void deleteLocal(java.nio.file.Path path) throws IOException {
         // Walk without following links or enumerating/sorting metadata for display.
@@ -362,11 +408,17 @@ final class FileStore {
             throw new IOException("不能复制到自己的子目录");
         for (Node ancestor = parent; ancestor != null; ancestor = ancestor.container)
             if (source.key().equals(ancestor.key())) throw new IOException("不能将归档放入自身");
-        if (parent.container != null && source.directory && source.file != null) {
+        if (parent.container != null && source.file != null) {
             Node outer = parent.container;
             while (outer.container != null) outer = outer.container;
-            if (outer.file != null && outer.file.getCanonicalPath().startsWith(source.file.getCanonicalPath() + "/"))
-                throw new IOException("不能将目录复制到其内部的归档");
+            // Compare by the physical path: a ROOT handle cannot be canonicalised by the app, but /storage/emulated/0
+            // and /sdcard can still name the same archive.
+            if (outer.file != null) {
+                String archivePath = physical(outer.file), sourcePath = physical(source.file);
+                if (archivePath.equals(sourcePath)) throw new IOException("不能将归档复制到自身");
+                if (source.directory && archivePath.startsWith(sourcePath + "/"))
+                    throw new IOException("不能将目录复制到其内部的归档");
+            }
         }
         if (source.file != null && parent.file != null && source.directory) {
             String a = source.file.getCanonicalPath(), b = parent.file.getCanonicalPath();
@@ -446,10 +498,12 @@ final class FileStore {
             // Targets are newly created; direct streaming needs no second complete cache copy.
             target = RootAccess.automatic(target);
             if (target.root) {
-                Process process = RootShell.command("cat > " + quote(target.path())).redirectErrorStream(true).start();
-                try (InputStream in = read(source); OutputStream out = process.getOutputStream()) { pump(in, out); }
-                catch (IOException error) { process.destroyForcibly(); throw error; }
-                await(process);
+                // Stream through app storage so ROOT never leaves a root-owned file in shared storage.
+                File staged = File.createTempFile("root-copy-", ".tmp", context.getCacheDir());
+                try {
+                    try (InputStream in = read(source); OutputStream out = new FileOutputStream(staged)) { pump(in, out); }
+                    applyRoot(staged, target);
+                } finally { Files.deleteIfExists(staged.toPath()); }
             } else try (InputStream in = read(source);
                         OutputStream out = target.uri != null
                                 ? context.getContentResolver().openOutputStream(target.uri, "wt")
@@ -515,10 +569,14 @@ final class FileStore {
         File f = File.createTempFile("import-", "-" + n.name.replaceAll("[^a-zA-Z0-9.]", "_"), context.getCacheDir());
         try (InputStream in = read(n); OutputStream out = new FileOutputStream(f)) { pump(in, out); }
         catch (IOException | RuntimeException e) { Files.deleteIfExists(f.toPath()); throw e; }
+        if (n.file != null) ArchiveOps.copyPassword(n.file, f);
         return f;
     }
     void release(Node source, File file) throws IOException {
-        if (source.file == null || !source.file.equals(file)) Files.deleteIfExists(file.toPath());
+        if (source.file == null || !source.file.equals(file)) {
+            ArchiveOps.clearPassword(file);
+            Files.deleteIfExists(file.toPath());
+        }
     }
     private static void checkRemoval(Node node) throws IOException {
         if (node.file != null && RootAccess.protectedStorageDirectory(node.file))
@@ -573,9 +631,12 @@ final class FileStore {
             throw new IOException("文件名无效");
     }
     static String quote(String s) { return "'" + s.replace("'", "'\\''") + "'"; }
-    static String rootWriteCommand(String path, String temporary) {
+    static String rootWriteCommand(String path, String temporary) { return rootWriteCommand(path, temporary, -1); }
+    static String rootWriteCommand(String path, String temporary, long size) {
         String source = quote(path), tmp = quote(temporary);
-        return "cat > " + tmp + " && chmod \"$(stat -c %a " + source + ")\" " + tmp
+        String verify = size < 0 ? "" : " && [ \"$(stat -c %s " + tmp + ")\" = " + size + " ]";
+        return "(set -C; cat > " + tmp + ")" + verify
+                + " && chmod \"$(stat -c %a " + source + ")\" " + tmp
                 + " && chown \"$(stat -c %u:%g " + source + ")\" " + tmp
                 + " && mv " + tmp + " " + source + " || { rm -f " + tmp + "; exit 1; }";
     }

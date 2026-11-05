@@ -40,6 +40,8 @@ dependencies {
     implementation "io.github.rosemoe:language-textmate:0.24.6"
     implementation "net.lingala.zip4j:zip4j:2.11.5"
     implementation "com.github.junrar:junrar:8.1.2"
+    implementation "org.apache.commons:commons-compress:1.28.0"
+    implementation "org.tukaani:xz:1.10"
     implementation "io.github.reandroid:ARSCLib:1.4.0"
     implementation "org.smali:baksmali:2.5.2"
     implementation "org.smali:smali:2.5.2"

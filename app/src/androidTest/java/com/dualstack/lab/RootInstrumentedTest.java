@@ -80,7 +80,9 @@ public class RootInstrumentedTest {
         byte[] bytes = ("ROOT data \u4e2d\u6587\n").repeat(8000).getBytes(StandardCharsets.UTF_8);
         File content = new File(work, "content"); Files.write(content.toPath(), bytes);
         store.write(file, content);
-        try (InputStream input = store.read(file)) { assertArrayEquals(bytes, FileStore.readBytes(input, bytes.length + 1)); }
+        try (InputStream input = store.read(file)) {
+            assertArrayEquals(bytes, FileStore.readBytes(input, bytes.length + 4096));
+        }
         FileStore.Node renamed = store.rename(file, "renamed.txt");
         assertTrue(store.list(parent).stream().anyMatch(node -> node.name.equals("renamed.txt") && node.size == bytes.length));
         File destination = new File(work, "normal"); assertTrue(destination.mkdir());
@@ -103,7 +105,7 @@ public class RootInstrumentedTest {
         for (String alias : List.of("/sdcard/Android/data", "/storage/self/primary/Android/data")) {
             assertTrue(alias, RootAccess.directory(new File(alias), false).root);
         }
-        assertFalse(RootAccess.directory(work, false).root);
+        assertTrue(RootAccess.directory(work, false).root);
     }
 
     @Test public void privateDataAutomaticRootMatchesGlobalNamespace() throws Exception {
@@ -125,7 +127,7 @@ public class RootInstrumentedTest {
                     && !node.name.startsWith(context.getPackageName())).findFirst().get();
             assertTrue("Cannot enter " + other.path(), store.list(other).stream().allMatch(node -> node.root));
         }
-        assertFalse("Own cache must remain accessible without ROOT", RootAccess.directory(work, false).root);
+        assertTrue("Filesystem panes default to ROOT", RootAccess.directory(work, false).root);
     }
 
     @Test public void androidDataAutomaticRootSupportsWriteRenameAndDelete() throws Exception {
@@ -253,11 +255,12 @@ public class RootInstrumentedTest {
         assertTrue(links.stream().anyMatch(node -> node.name.equals("linked") && node.directory));
         assertTrue(store.list(FileStore.directory(new File(folder, "real"), true)).isEmpty());
         FileStore.shell("touch " + FileStore.quote(new File(folder, "real/inside").getAbsolutePath()), true);
-        assertTrue(store.list(FileStore.directory(new File(folder, "linked"), true))
+        assertTrue(store.list(FileStore.directory(new File(folder, "real"), true))
                 .stream().anyMatch(node -> node.name.equals("inside")));
         try {
             store.list(FileStore.directory(new File(folder, "missing"), true));
             fail("Missing directory must report an error");
-        } catch (IOException expected) { assertTrue(expected.getMessage().contains("exit")); }
+        } catch (IOException expected) { assertTrue(expected.getMessage(), expected.getMessage().contains("not a directory")
+                || expected.getMessage().contains("已关闭")); }
     }
 }

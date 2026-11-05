@@ -46,7 +46,8 @@ public class ArchiveRarInstrumentedTest {
         assertEquals("Short text for example", new String(Files.readAllBytes(
                 new File(output, "files/test/short-text.txt").toPath()), StandardCharsets.UTF_8));
         try { ArchiveOps.rewrite(rar, null, null, java.util.Collections.emptyMap()); fail("RAR rewrite accepted"); }
-        catch (IOException expected) { assertTrue(expected.getMessage().contains("RAR")); }
+        catch (IOException expected) { assertTrue("message=" + expected.getMessage(), expected.getMessage() != null
+                && expected.getMessage().contains("暂不支持直接修改")); }
     }
 
     @Test public void rar5ListsReadsAndExtractsFiles() throws Exception {

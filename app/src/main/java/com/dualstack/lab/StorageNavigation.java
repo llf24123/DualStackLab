@@ -16,6 +16,13 @@ final class StorageNavigation {
         return location(store.parent(location(node)));
     }
 
+    /** Paths whose metadata the media provider owns; writes must run with the app's own identity there. */
+    static boolean ordinaryStorage(File path) {
+        String value = normalized(path);
+        return value.startsWith("/storage/emulated/") || value.startsWith("/storage/self/primary")
+                || value.startsWith("/mnt/user/") || value.equals("/sdcard") || value.startsWith("/sdcard/");
+    }
+
     static boolean storageContainer(File path) {
         String value = normalized(path);
         return value.equals("/storage") || value.equals("/storage/emulated");

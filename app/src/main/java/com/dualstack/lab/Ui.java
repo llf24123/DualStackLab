@@ -26,6 +26,8 @@ final class Ui {
     static int SURFACE = Color.WHITE, PANEL = 0xfff6f8f7, WARNING = 0xfff5f3e9, ICON_BG = 0xff303030;
     static boolean dark;
     static final int GOLD = Color.rgb(193, 143, 42);
+    /** Search-hit row tint: a light green that stays distinct from selection and from the dark theme surface. */
+    static int HIT = 0xffdcf3e4;
 
     static String themeMode(Context context) { return context.getSharedPreferences("appearance", 0).getString("mode", "system"); }
     static boolean isDark(Context context) {
@@ -45,7 +47,8 @@ final class Ui {
         SURFACE = dark ? 0xff181b19 : Color.WHITE;
         PANEL = dark ? 0xff222624 : 0xfff6f8f7;
         WARNING = dark ? 0xff3b3520 : 0xfff5f3e9;
-        ICON_BG = dark ? 0xff454a47 : 0xff303030;
+        ICON_BG = dark ? 0xff000000 : 0xff303030;
+        HIT = dark ? 0xffa6e4b4 : 0xff69a977;
     }
     static void chooseTheme(Activity activity) {
         String mode = themeMode(activity);
@@ -57,7 +60,7 @@ final class Ui {
                     d.dismiss(); activity.recreate();
                 }).setNegativeButton("取消", null).show();
     }
-    static int[] palette() { return new int[]{SURFACE, PANEL, TEXT, MUTED, ACCENT, LINE, TINT, WARNING, INK}; }
+    static int[] palette() { return new int[]{SURFACE, PANEL, TEXT, MUTED, ACCENT, LINE, TINT, WARNING, INK, HIT, ICON_BG}; }
     static void updateTheme(Activity activity, int[] old) {
         configure(activity);
         int[] now = palette();

@@ -12,7 +12,6 @@ import android.provider.Settings;
 import android.text.*;
 import android.view.*;
 import android.widget.*;
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 import java.io.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
@@ -22,6 +21,7 @@ import java.util.regex.Pattern;
 public class MainActivity extends LabActivity {
     private static final int TREE = 100, ARTIFACT = 200, INSTALLED = 400;
     private FileStore store;
+    private AppIcons appIcons;
     private DirectoryPlaces directoryPlaces;
     private Pane left, right, active;
     private TextView title, subtitle, status;
@@ -44,7 +44,7 @@ public class MainActivity extends LabActivity {
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
-        store = new FileStore(this);
+        store = new FileStore(this); appIcons = new AppIcons(this);
         if (saved != null && saved.getString("pendingInstall") != null) pendingInstall = new File(saved.getString("pendingInstall"));
         directoryPlaces = new DirectoryPlaces(this);
         showHidden = getPreferences(0).getBoolean("showHidden", true);
@@ -86,7 +86,11 @@ public class MainActivity extends LabActivity {
         status.setPadding(dp(12), 0, dp(12), 0); status.setBackgroundColor(Ui.PANEL);
         root.addView(status, lp(-1, 20));
         status.setVisibility(View.GONE);
-        actions = new DirectorySheet.SwipeLayout(this, true, this::directorySheet);
+        DirectorySheet.SwipeLayout actionGestures = new DirectorySheet.SwipeLayout(this, true, this::directorySheet);
+        actions = actionGestures;
+        actionGestures.setDragCallbacks(() -> { directorySheet(true); },
+                distance -> { if (sheet != null) sheet.drag(distance); },
+                commit -> { if (sheet != null) sheet.finishDrag(commit); });
         actions.setOrientation(LinearLayout.HORIZONTAL); actions.setGravity(Gravity.CENTER_VERTICAL);
         actions.setContentDescription("底部操作栏"); actions.setBackgroundColor(Ui.SURFACE); root.addView(actions, lp(-1, 58));
         Ui.install(this, root);
@@ -100,6 +104,23 @@ public class MainActivity extends LabActivity {
     }
     private void navigateIntent(Intent intent) {
         if (intent == null) return;
+        String resultKey = intent.getStringExtra("searchResult");
+        if (resultKey != null) {
+            intent.removeExtra("searchResult");
+            Pane target = active;
+            int token = ++externalGeneration;
+            Tasks.run(this, () -> store.fromKey(resultKey), node -> {
+                if (token != externalGeneration) return;
+                FileStore.Node parent = store.parent(node);
+                if (parent != null) {
+                    clearSearchMarks();
+                    target.navigate(parent);
+                    target.mark(node);
+                } else if (node.directory) target.navigate(node);
+                else Tasks.toast(this, "来源未提供可定位的目录");
+            });
+            return;
+        }
         Uri external = ExternalFiles.uri(intent);
         if (external != null) {
             String key = intent.getAction() + ":" + external;
@@ -153,14 +174,19 @@ public class MainActivity extends LabActivity {
     }
     @Override protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out);
-        out.putString("left", left.location.key()); out.putString("right", right.location.key());
+        out.putString("left", locationKey(left.location)); out.putString("right", locationKey(right.location));
         out.putString("handledExternal", handledExternal);
         if (pendingInstall != null) out.putString("pendingInstall", pendingInstall.getAbsolutePath());
     }
     @Override protected void onPause() {
         super.onPause();
         exitArmedAt = 0;
-        getPreferences(0).edit().putString("left", left.location.key()).putString("right", right.location.key()).apply();
+        getPreferences(0).edit().putString("left", locationKey(left.location))
+                .putString("right", locationKey(right.location)).apply();
+    }
+    /** Saved keys keep shared-storage paths ROOT-free so a revoked su grant never hides reachable files. */
+    private static String locationKey(FileStore.Node node) {
+        return node != null && node.root && node.file != null ? node.path() : node == null ? "" : node.key();
     }
     @Override protected void onResume() {
         super.onResume();
@@ -193,6 +219,14 @@ public class MainActivity extends LabActivity {
         }
     }
     private int dp(int n) { return Ui.dp(this, n); }
+    /** Small halo shown under a pulled list; it fills in once the release would refresh. */
+    private android.graphics.drawable.GradientDrawable ring(boolean armed) {
+        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
+        shape.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        shape.setColor(0x00000000);
+        shape.setStroke(dp(2), armed ? Ui.ACCENT : Ui.TEXT);
+        return shape;
+    }
     private LinearLayout.LayoutParams lp(int w, int h) {
         return new LinearLayout.LayoutParams(w < 0 ? w : dp(w), h < 0 ? h : dp(h));
     }
@@ -215,19 +249,26 @@ public class MainActivity extends LabActivity {
     private void actionBar() {
         if (active == null) return;
         boolean selection = !active.selected.isEmpty();
+        if (!selection) { active.rangeSelecting = false; active.selectionAnchor = null; }
         boolean rebuild = selectionActions == null || selectionActions != selection;
         selectionActions = selection;
         if (rebuild) actions.removeAllViews();
         status.setVisibility(active.selected.isEmpty() && !busy ? View.GONE : View.VISIBLE);
         if (selection) {
             if (rebuild) {
-                addAction(R.drawable.ic_copy, "复制", () -> transfer(active, other(), false));
-                addAction(R.drawable.ic_move, "移动", () -> transfer(active, other(), true));
-                addAction(R.drawable.ic_trash, "删除", this::deleteSelection);
-                addAction(R.drawable.ic_more, "操作", this::selectionMenu);
-                addAction(R.drawable.ic_check, "清选", () -> { active.selected.clear(); active.adapter.notifyDataSetChanged(); actionBar(); });
+                View all = addSelectionAction(R.drawable.ic_select_all, "全选", () -> active.selectAll());
+                all.setOnLongClickListener(v -> { conditionalSelection(); return true; });
+                addSelectionAction(R.drawable.ic_swap, "反选", this::invertVisibleSelection);
+                addSelectionAction(R.drawable.ic_stop, "取消", () -> { active.resetSelection(); active.selectionChanged(); });
+                View range = addSelectionAction(R.drawable.ic_sort, "连选", () -> active.beginRange());
+                range.setTooltipText("点击连选，长按按条件选择");
+                range.setOnLongClickListener(v -> { conditionalSelection(); return true; });
+                addSelectionAction(R.drawable.ic_more, "操作", this::selectionMenu);
             }
-            status.setText("已选择 " + active.selected.size() + " 项 · " + (active == left ? "左 → 右" : "右 → 左"));
+            actions.getChildAt(3).setSelected(active.rangeSelecting);
+            actions.getChildAt(3).setBackground(Ui.ripple(active.rangeSelecting ? Ui.TINT : Ui.SURFACE));
+            status.setText("已选择 " + active.selected.size() + " 项 · " + (active.rangeSelecting
+                    ? "连选：点击范围终点" : "长按全选或连选可按条件选择"));
         } else {
             if (rebuild) {
                 addAction(R.drawable.ic_back, "后退", () -> active.back());
@@ -254,6 +295,22 @@ public class MainActivity extends LabActivity {
     private void addAction(int icon, String text, Runnable task) {
         actions.addView(Ui.icon(this, icon, text, Ui.TEXT, task), new LinearLayout.LayoutParams(0, -1, 1));
     }
+    private View addSelectionAction(int icon, String text, Runnable task) {
+        View button = Ui.command(this, icon, text, task);
+        actions.addView(button, new LinearLayout.LayoutParams(0, -1, 1));
+        return button;
+    }
+    private void conditionalSelection() {
+        Pane pane = active;
+        pane.rangeSelecting = false;
+        FileStore.Node reference = pane.selectionReference();
+        fileMenu = SelectionTools.show(this, pane.entries, reference, result -> {
+            if (!result.append()) pane.selected.clear();
+            pane.selected.addAll(result.keys());
+            pane.selectionChanged();
+        });
+        actionBar();
+    }
     private Pane other() { return active == left ? right : left; }
     private void places() {
         drawer = NavigationDrawer.show(this, () -> navigateDirectory(new File("/"), true),
@@ -266,12 +323,14 @@ public class MainActivity extends LabActivity {
             if (preferRoot) Tasks.toast(this, node.root ? "已使用 ROOT 访问" : "su 不可用，使用普通权限访问");
         });
     }
-    private void directorySheet() {
+    private void directorySheet() { directorySheet(false); }
+    private void directorySheet(boolean dragging) {
         Pane target = active;
         if (target == null || target.location == null) return;
+        if (sheet != null) sheet.dismiss();
         sheet = new DirectorySheet(this, directoryPlaces, target.location, entry ->
                 Tasks.run(this, () -> entry.resolve(store), node -> { activate(target); target.navigate(node); }));
-        sheet.show();
+        if (dragging) sheet.showForDrag(); else sheet.show();
     }
     private void chooseDirectory() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -286,16 +345,14 @@ public class MainActivity extends LabActivity {
         startActivityForResult(intent, TREE + (active == left ? 0 : 1));
     }
     private void more() {
-        String[] names = {"刷新", "搜索", "全选", "过滤", "排序方式", "打开终端", "隐藏文件", "添加书签", "设为首页", "交换窗口", "设置", "退出"};
-        int[] icons = {R.drawable.ic_refresh, R.drawable.ic_search, R.drawable.ic_select_all, R.drawable.ic_filter,
-                R.drawable.ic_sort, R.drawable.ic_terminal, R.drawable.ic_eye, R.drawable.ic_bookmark, R.drawable.ic_home,
-                R.drawable.ic_swap, R.drawable.ic_settings, R.drawable.ic_exit};
+        String[] names = {"刷新", "搜索", "全选", "反选当前列表", "过滤", "排序方式", "打开终端", "隐藏文件", "添加书签", "设为首页", "交换窗口", "设置", "退出"};
+        int[] icons = {R.drawable.ic_refresh, R.drawable.ic_search, R.drawable.ic_select_all, R.drawable.ic_check,
+                R.drawable.ic_filter, R.drawable.ic_sort, R.drawable.ic_terminal, R.drawable.ic_eye, R.drawable.ic_bookmark,
+                R.drawable.ic_home, R.drawable.ic_swap, R.drawable.ic_settings, R.drawable.ic_exit};
         if (active.location.container != null) {
             names = Arrays.copyOf(names, names.length + 1); names[names.length - 1] = "解压当前目录";
             icons = Arrays.copyOf(icons, icons.length + 1); icons[icons.length - 1] = R.drawable.ic_download;
         }
-        names = Arrays.copyOf(names, names.length + 1); names[names.length - 1] = "反选当前列表";
-        icons = Arrays.copyOf(icons, icons.length + 1); icons[icons.length - 1] = R.drawable.ic_check;
         LinearLayout menu = Ui.column(this); menu.setBackgroundColor(Ui.SURFACE);
         ScrollView scroll = new ScrollView(this); scroll.addView(menu);
         int screenHeight = getResources().getDisplayMetrics().heightPixels;
@@ -308,6 +365,7 @@ public class MainActivity extends LabActivity {
             row.addView(Ui.image(this, icons[i], Ui.TEXT), lp(24, 24));
             TextView text = Ui.text(this, names[i], 16, Ui.TEXT); text.setPadding(dp(14), 0, 0, 0);
             row.addView(text, new LinearLayout.LayoutParams(0, dp(48), 1)); row.setBackground(Ui.ripple(Ui.SURFACE));
+            row.setContentDescription(names[i]);
             row.setOnClickListener(v -> { popup.dismiss(); menuAction(which); }); menu.addView(row);
         }
         int[] location = new int[2]; moreButton.getLocationInWindow(location);
@@ -317,22 +375,19 @@ public class MainActivity extends LabActivity {
         switch (which) {
             case 0 -> active.reload(true);
             case 1 -> searchDialog();
-            case 2 -> { for (FileStore.Node f : active.entries) active.selected.add(f.key()); active.adapter.notifyDataSetChanged(); actionBar(); }
-            case 3 -> filterDialog();
-            case 4 -> new AlertDialog.Builder(this).setTitle("排序方式").setSingleChoiceItems(new String[]{"名称", "时间", "大小"},
+            case 2 -> active.selectAll();
+            case 3 -> invertVisibleSelection();
+            case 4 -> filterDialog();
+            case 5 -> new AlertDialog.Builder(this).setTitle("排序方式").setSingleChoiceItems(new String[]{"名称", "时间", "大小"},
                     active.sort, (d, n) -> { active.sort = n; active.apply(); d.dismiss(); }).show();
-            case 5 -> shellDialog();
-            case 6 -> hiddenOptions();
-            case 7 -> { directoryPlaces.bookmark(DirectoryPlaces.Entry.from(active.location)); Tasks.toast(this, "已添加书签"); }
-            case 8 -> { getPreferences(0).edit().putString("home-" + (active == left ? "left" : "right"), active.location.key()).apply(); Tasks.toast(this, "已设为当前窗口首页"); }
-            case 9 -> { FileStore.Node a = left.location, b = right.location; left.navigate(b); right.navigate(a); }
-            case 10 -> settings();
-            case 11 -> finish();
-            case 12 -> {
-                if (active.location.container != null) extractDialog(List.of(active.location));
-                else invertVisibleSelection();
-            }
-            case 13 -> invertVisibleSelection();
+            case 6 -> shellDialog();
+            case 7 -> hiddenOptions();
+            case 8 -> { directoryPlaces.bookmark(DirectoryPlaces.Entry.from(active.location)); Tasks.toast(this, "已添加书签"); }
+            case 9 -> { getPreferences(0).edit().putString("home-" + (active == left ? "left" : "right"), locationKey(active.location)).apply(); Tasks.toast(this, "已设为当前窗口首页"); }
+            case 10 -> { FileStore.Node a = left.location, b = right.location; left.navigate(b); right.navigate(a); }
+            case 11 -> settings();
+            case 12 -> finish();
+            case 13 -> extractDialog(List.of(active.location));
         }
     }
     private void invertVisibleSelection() {
@@ -340,7 +395,8 @@ public class MainActivity extends LabActivity {
             if (!showHidden && node.name.startsWith(".")) continue;
             if (!active.selected.remove(node.key())) active.selected.add(node.key());
         }
-        active.adapter.notifyDataSetChanged(); actionBar();
+        active.rangeSelecting = false;
+        active.selectionChanged();
     }
     private void hiddenOptions() {
         new AlertDialog.Builder(this).setTitle("隐藏文件").setSingleChoiceItems(new String[]{"显示隐藏文件", "不显示隐藏文件"},
@@ -353,7 +409,11 @@ public class MainActivity extends LabActivity {
         new AlertDialog.Builder(this).setTitle("设置").setItems(new String[]{"主题", "隐藏文件", "恢复默认首页"}, (d, n) -> {
             if (n == 0) Ui.chooseTheme(this);
             else if (n == 1) hiddenOptions();
-            else { getPreferences(0).edit().remove("home-left").remove("home-right").apply(); Tasks.toast(this, "首页设置已清除"); }
+            else new AlertDialog.Builder(this).setTitle("恢复默认首页？").setMessage("左右窗口下次启动都会回到内部存储。")
+                    .setNegativeButton("取消", null).setPositiveButton("恢复", (confirm, x) -> {
+                        getPreferences(0).edit().remove("home-left").remove("home-right").apply();
+                        Tasks.toast(this, "首页设置已清除");
+                    }).show();
         }).show();
     }
     @Override public void onDestroy() {
@@ -365,22 +425,34 @@ public class MainActivity extends LabActivity {
         if (drawer != null) drawer.dismiss();
         if (sheet != null) sheet.dismiss();
         if (popupMenu != null) popupMenu.dismiss();
+        if (fileMenu != null) fileMenu.dismiss();
         super.onDestroy();
     }
     private void jump() {
         Pane pane = active;
-        LinearLayout body = Ui.column(this);
+        LinearLayout body = Ui.column(this); body.setPadding(dp(20), dp(4), dp(20), dp(4));
         EditText input = Ui.input(this, "/storage/emulated/0/Download");
         input.setText(pane.location.file != null ? pane.location.path() : "");
-        CheckBox rootMode = new CheckBox(this); rootMode.setText("使用 ROOT 访问");
-        rootMode.setTextColor(Ui.TEXT); rootMode.setChecked(pane.location.root);
-        body.addView(input); body.addView(rootMode);
-        new AlertDialog.Builder(this).setTitle("路径跳转").setView(body)
-                .setNegativeButton("取消", null).setPositiveButton("打开", (d, w) -> {
-                    File f = new File(input.getText().toString().trim());
-                    if (!f.isAbsolute()) { Tasks.toast(this, "请输入绝对路径"); return; }
-                    pane.navigate(FileStore.directory(f, rootMode.isChecked()));
-                }).show();
+        input.setContentDescription("跳转路径");
+        input.setTextColor(Ui.ACCENT);
+        body.addView(input);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("跳转").setView(body)
+                .setNeutralButton("粘贴", null).setNegativeButton("取消", null).setPositiveButton("确定", null).create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                android.content.ClipboardManager clipboard =
+                        (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                CharSequence text = clipboard.hasPrimaryClip() && clipboard.getPrimaryClip().getItemCount() > 0
+                        ? clipboard.getPrimaryClip().getItemAt(0).coerceToText(this) : "";
+                if (text.length() > 0) input.setText(text.toString().trim());
+            });
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                File f = new File(input.getText().toString().trim());
+                if (!f.isAbsolute()) { input.setError("请输入绝对路径"); return; }
+                dialog.dismiss();
+                navigateDirectory(f, false);
+            });
+        }); dialog.show();
     }
     private void filterDialog() {
         Pane pane = active;
@@ -422,26 +494,27 @@ public class MainActivity extends LabActivity {
         heading.addView(hint, new LinearLayout.LayoutParams(0, dp(34), 1));
         TextView close = Ui.text(this, "×", 24, Ui.MUTED); close.setGravity(Gravity.CENTER);
         close.setContentDescription("关闭文件操作"); close.setBackground(Ui.ripple(Ui.SURFACE));
-        Runnable clear = () -> { source.selected.clear(); source.adapter.notifyDataSetChanged(); actionBar(); };
+        Runnable clear = () -> { source.resetSelection(); source.selectionChanged(); };
         close.setOnClickListener(v -> { clear.run(); dialog.dismiss(); });
         heading.addView(close, lp(36, 34)); body.addView(heading); body.addView(Ui.line(this));
-        String[] labels = {"复制", "移动", "删除", "重命名", "工具", "压缩", "属性", "分享", "打开方式…", "添加书签"};
+        String[] labels = {"复制", "移动", "删除", "重命名", "工具", "压缩", "解压", "属性", "分享", "打开方式…", "添加书签"};
+        int[] icons = {R.drawable.ic_copy, R.drawable.ic_cut, R.drawable.ic_trash, R.drawable.ic_edit,
+                R.drawable.ic_tools, R.drawable.ic_download, R.drawable.ic_archive, R.drawable.ic_info,
+                R.drawable.ic_share, R.drawable.ic_check, R.drawable.ic_bookmark};
+        // Archives keep both choices: packing the archive itself is as valid as unpacking it.
         boolean extraction = nodes.stream().allMatch(n -> n.container != null)
                 || single && !node.directory && (isArchive(node.name.toLowerCase(Locale.ROOT)) || ApkInstall.isApkName(node.name));
-        if (extraction) labels[5] = "解压";
-        int[] icons = {R.drawable.ic_copy, R.drawable.ic_cut, R.drawable.ic_trash, R.drawable.ic_edit,
-                R.drawable.ic_tools, R.drawable.ic_download, R.drawable.ic_info, R.drawable.ic_share,
-                R.drawable.ic_check, R.drawable.ic_bookmark};
-        boolean[] enabled = {!busy, !busy, !busy, single && !busy, single, !busy, single, files,
+        boolean[] enabled = {!busy, !busy, !busy, single && !busy, single, !busy, extraction && !busy, single, files,
                 single && !node.directory, single && node.directory};
         Runnable[] run = {() -> transfer(nodes, source, target, false), () -> transfer(nodes, source, target, true),
-                this::deleteSelection, () -> rename(node), () -> fileTools(node), () -> { if (extraction) extractDialog(nodes); else compress(nodes); },
-                () -> properties(node), () -> shareFiles(nodes), () -> openWith(node),
+                this::deleteSelection, () -> rename(node), () -> fileTools(node), () -> compress(nodes),
+                () -> extractDialog(nodes), () -> properties(node), () -> shareFiles(nodes), () -> openWith(node),
                 () -> { directoryPlaces.bookmark(DirectoryPlaces.Entry.from(node)); Tasks.toast(this, "已添加书签"); }};
-        for (int row = 0; row < 5; row++) {
+        for (int row = 0; row < (labels.length + 1) / 2; row++) {
             LinearLayout line = Ui.row(this);
             for (int column = 0; column < 2; column++) {
                 int index = row * 2 + column;
+                if (index >= labels.length) { line.addView(new View(this), new LinearLayout.LayoutParams(0, dp(58), 1)); continue; }
                 LinearLayout cell = Ui.row(this); cell.setPadding(dp(12), 0, dp(6), 0);
                 int color = enabled[index] ? Ui.TEXT : Ui.MUTED;
                 ImageView icon = Ui.image(this, icons[index], color); cell.addView(icon, lp(24, 24));
@@ -592,21 +665,44 @@ public class MainActivity extends LabActivity {
         }, done);
     }
     private void compress(List<FileStore.Node> nodes) {
-        Pane pane = active; EditText name = Ui.input(this, "归档名称"); name.setText("archive.zip");
-        new AlertDialog.Builder(this).setTitle("压缩为 ZIP").setView(name).setNegativeButton("取消", null)
-                .setPositiveButton("压缩", (d, w) -> {
-                    String fileName = name.getText().toString();
-                    mutate(() -> {
-                        FileStore.checkName(fileName);
-                        File tmp = File.createTempFile("pack-", ".zip", getCacheDir());
-                        try {
-                            ArchiveOps.pack(store, nodes, tmp);
-                            FileStore.Node out = store.create(pane.location, fileName, false);
-                            try { store.write(out, tmp); } catch (IOException e) { store.delete(out); throw e; }
-                        } finally { java.nio.file.Files.deleteIfExists(tmp.toPath()); }
-                        return true;
-                    }, ok -> pane.reload());
-                }).show();
+        Pane pane = active; FileStore.Node destination = pane.location;
+        LinearLayout body = Ui.column(this); body.setPadding(dp(16), dp(4), dp(16), dp(8));
+        EditText name = Ui.input(this, "归档名称"); name.setText("archive.zip"); name.setContentDescription("压缩文件名称");
+        Spinner formats = new Spinner(this); formats.setContentDescription("压缩格式");
+        formats.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"ZIP", "TAR", "TAR.GZ", "7Z"}));
+        EditText password = Ui.input(this, "压缩密码（留空不加密）"); password.setContentDescription("压缩密码");
+        password.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        TextView note = Ui.text(this, "ZIP 密码使用 AES-256 加密", 12, Ui.MUTED);
+        body.addView(name); body.addView(formats); body.addView(password); body.addView(note);
+        String[] extensions = {".zip", ".tar", ".tar.gz", ".7z"};
+        formats.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                String value = name.getText().toString().replaceFirst("(?i)\\.(?:tar\\.gz|zip|tar|tgz|7z)$", "");
+                name.setText(value + extensions[position]); password.setEnabled(position == 0);
+                if (position != 0) password.setText("");
+                note.setText(position == 0 ? "ZIP 密码使用 AES-256 加密" : "此格式不支持密码；需要加密请选 ZIP");
+            }
+            public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("压缩文件").setView(body).setNegativeButton("取消", null)
+                .setPositiveButton("压缩", null).create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(-1).setOnClickListener(view -> {
+            String fileName = name.getText().toString();
+            try { FileStore.checkName(fileName); } catch (IOException error) { name.setError(error.getMessage()); return; }
+            String format = new String[]{"zip", "tar", "tar.gz", "7z"}[formats.getSelectedItemPosition()];
+            char[] secret = password.getText().toString().toCharArray();
+            dialog.dismiss();
+            mutate(() -> {
+                File tmp = File.createTempFile("pack-", "." + format, getCacheDir());
+                try {
+                    ArchiveOps.pack(store, nodes, tmp, format, secret);
+                    FileStore.Node out = store.create(destination, fileName, false);
+                    try { store.write(out, tmp); } catch (IOException error) { store.delete(out); throw error; }
+                    if (secret.length > 0 && out.file != null) ArchiveOps.setPassword(out.file, secret);
+                    return true;
+                } finally { Arrays.fill(secret, '\0'); java.nio.file.Files.deleteIfExists(tmp.toPath()); }
+            }, ok -> { pane.reload(); Tasks.toast(this, "压缩完成"); });
+        })); dialog.show();
     }
     private void extractDialog(List<FileStore.Node> nodes) {
         Pane source = active, target = other();
@@ -616,7 +712,7 @@ public class MainActivity extends LabActivity {
         LinearLayout body = Ui.column(this); body.setPadding(dp(16), dp(4), dp(16), 0);
         EditText path = Ui.input(this, "解压到目录"); path.setContentDescription("解压目标目录");
         path.setText(initial.path()); path.setEnabled(initial.file != null); body.addView(path);
-        String base = nodes.size() == 1 ? nodes.get(0).name.replaceFirst("(?i)\\.(zip|rar|jar|apk(?:\\.1)?|apks|xapk)$", "") : "extracted";
+        String base = nodes.size() == 1 ? nodes.get(0).name.replaceFirst("(?i)\\.(zip|rar|jar|apk(?:\\.1)?|apks|xapk|tar\\.gz|tar|tgz|7z)$", "") : "extracted";
         if (base.isBlank()) base = "extracted";
         EditText name = Ui.input(this, "新建文件夹"); name.setContentDescription("解压文件夹名称"); name.setText(base); body.addView(name);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("解压").setView(body)
@@ -641,15 +737,25 @@ public class MainActivity extends LabActivity {
     private void open(FileStore.Node node) {
         String name = node.name.toLowerCase(Locale.ROOT);
         if (ApkInstall.isApkName(name)) { apkDialog(node); return; }
-        if (isArchive(name)) { browseArchive(node); return; }
+        if (isArchive(name)) {
+            if (node.file != null && ArchiveOps.isEncrypted(node.file) && !ArchiveOps.hasPassword(node.file)) {
+                promptPassword(node.file, () -> browseArchive(node)); return;
+            }
+            browseArchive(node); return;
+        }
         if (node.container != null && name.endsWith(".xml")) {
+            if (node.container.name.toLowerCase(Locale.ROOT).endsWith(".rar")) { readOnlyText(node); return; }
             Tasks.run(this, () -> {
                 try (InputStream input = store.read(node)) {
                     return com.reandroid.arsc.chunk.xml.ResXmlDocument.isResXmlBlock(FileStore.readBytes(input, 8));
                 }
             }, binary -> { if (binary) structuredArchive(node, "xml"); else editText(node); }); return;
         }
-        if (node.container != null && name.equals("resources.arsc")) { structuredArchive(node, "arsc"); return; }
+        if (node.container != null && name.equals("resources.arsc")) {
+            if (node.container.name.toLowerCase(Locale.ROOT).endsWith(".rar")) readOnlyText(node);
+            else structuredArchive(node, "arsc");
+            return;
+        }
         if (name.endsWith(".elf")) { executeFile(node); return; }
         if (name.endsWith(".sh")) {
             scriptDialog(node);
@@ -665,7 +771,8 @@ public class MainActivity extends LabActivity {
         Intent i = new Intent(this, type); node.put(i); startActivity(i);
     }
     private static boolean isArchive(String name) {
-        return name.endsWith(".zip") || name.endsWith(".rar") || name.endsWith(".jar") || name.endsWith(".apks") || name.endsWith(".xapk");
+        return name.endsWith(".zip") || name.endsWith(".rar") || name.endsWith(".jar") || name.endsWith(".apks") || name.endsWith(".xapk")
+                || name.endsWith(".tar") || name.endsWith(".tar.gz") || name.endsWith(".tgz") || name.endsWith(".7z");
     }
     private static boolean knownType(String name) {
         String lower = name.toLowerCase(Locale.ROOT);
@@ -674,6 +781,10 @@ public class MainActivity extends LabActivity {
     }
     private void editText(FileStore.Node node) {
         Intent intent = new Intent(this, EditorActivity.class); node.put(intent); startActivity(intent);
+    }
+    private void readOnlyText(FileStore.Node node) {
+        Intent intent = new Intent(this, EditorActivity.class); node.put(intent);
+        intent.putExtra("readOnly", true).putExtra("displayName", node.name); startActivity(intent);
     }
     private void archiveTools(FileStore.Node node) {
         Intent intent = new Intent(this, ArchiveActivity.class); node.put(intent); startActivity(intent);
@@ -689,6 +800,18 @@ public class MainActivity extends LabActivity {
             intent.putExtra("archivePath", file.getAbsolutePath()).putExtra("archiveEntry", node.entry)
                     .putExtra("displayName", node.name).putExtra("mode", mode).putExtra("ownedArchive", true); startActivity(intent);
         });
+    }
+    private void promptPassword(File file, Runnable after) {
+        EditText input = Ui.input(this, "ZIP 密码");
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        new AlertDialog.Builder(this).setTitle("加密 ZIP")
+                .setMessage("输入密码后浏览、查看和解压都会使用本次密码")
+                .setView(input).setNegativeButton("取消", null)
+                .setPositiveButton("打开", (d, w) -> {
+                    String value = input.getText().toString();
+                    if (value.isEmpty()) { Tasks.toast(this, "密码不能为空"); return; }
+                    ArchiveOps.setPassword(file, value.toCharArray()); after.run();
+                }).show();
     }
     private void browseArchive(FileStore.Node node) {
         Pane pane = active;
@@ -802,7 +925,7 @@ public class MainActivity extends LabActivity {
     }
     private void scriptDialog(FileStore.Node node) {
         android.content.SharedPreferences prefs = getSharedPreferences("script-execution", 0);
-        boolean root = prefs.getBoolean("root", node.root), pipe = prefs.getBoolean("pipe", false);
+        boolean root = node.root || prefs.getBoolean("root", false), pipe = prefs.getBoolean("pipe", false);
         LinearLayout body = Ui.column(this); body.setPadding(dp(24), dp(8), dp(24), dp(12));
         TextView prompt = Ui.text(this, "请选择要执行的操作", 17, Ui.TEXT); body.addView(prompt);
         TextView mode = Ui.text(this, pipe ? "管道执行" : "普通执行", 13, Ui.MUTED);
@@ -821,7 +944,7 @@ public class MainActivity extends LabActivity {
     private void scriptSettings(FileStore.Node node) {
         android.content.SharedPreferences prefs = getSharedPreferences("script-execution", 0);
         LinearLayout body = Ui.column(this); body.setPadding(dp(18), 0, dp(18), dp(8));
-        CheckBox root = new CheckBox(this); root.setText("使用 ROOT 执行"); root.setChecked(prefs.getBoolean("root", node.root));
+        CheckBox root = new CheckBox(this); root.setText("使用 ROOT 执行"); root.setChecked(node.root || prefs.getBoolean("root", false));
         RadioGroup methods = new RadioGroup(this);
         RadioButton normal = new RadioButton(this); normal.setId(View.generateViewId()); normal.setText("普通执行");
         RadioButton pipe = new RadioButton(this); pipe.setId(View.generateViewId()); pipe.setText("管道执行");
@@ -877,62 +1000,19 @@ public class MainActivity extends LabActivity {
         CheckBox regex = new CheckBox(this); regex.setText("正则表达式");
         CheckBox content = new CheckBox(this); content.setText("搜索文本内容（每个文件最多 2 MiB）");
         body.addView(query); body.addView(scope); body.addView(regex); body.addView(content);
-        new AlertDialog.Builder(this).setTitle("递归搜索 · 当前目录").setView(body).setNegativeButton("取消", null)
-                .setPositiveButton("搜索", (d, w) -> {
+        AlertDialog.Builder search = new AlertDialog.Builder(this).setTitle("递归搜索 · 当前目录").setView(body).setNegativeButton("取消", null);
+        if (SearchJob.active() != null) search.setNeutralButton("已有搜索结果", (d, w) -> startActivity(new Intent(this, SearchActivity.class)));
+        search.setPositiveButton("搜索", (d, w) -> {
                     String q = query.getText().toString(); if (q.isEmpty()) return;
                     Pattern pattern;
                     try { pattern = Pattern.compile(regex.isChecked() ? q : Pattern.quote(q), Pattern.CASE_INSENSITIVE); }
                     catch (Exception e) { Tasks.toast(this, e.getMessage()); return; }
                     boolean contents = content.isChecked();
-                    FileStore.Node searchRoot = scope.getSelectedItemPosition() == 1 ?
-                            FileStore.directory(Environment.getExternalStorageDirectory(), false) : start;
-                    AtomicBoolean cancel = new AtomicBoolean();
-                    TextView progress = Ui.text(this, "搜索中…", 13, Ui.TEXT); progress.setPadding(dp(20), dp(20), dp(20), dp(20));
-                    AlertDialog waiting = new AlertDialog.Builder(this).setTitle("搜索").setView(progress)
-                            .setNegativeButton("停止", (x, y) -> cancel.set(true)).create();
-                    waiting.setOnCancelListener(x -> cancel.set(true)); waiting.show();
-                    Tasks.run(this, () -> {
-                        ArrayList<FileStore.Node> matches = new ArrayList<>();
-                        ArrayDeque<FileStore.Node> queue = new ArrayDeque<>(); queue.add(searchRoot);
-                        Set<String> visited = new HashSet<>(); int denied = 0;
-                        while (!queue.isEmpty() && !cancel.get() && matches.size() < 2000) {
-                            FileStore.Node dir = queue.remove();
-                            String key = dir.file != null ? dir.file.getCanonicalPath() : dir.key();
-                            if (!visited.add(key)) continue;
-                            List<FileStore.Node> children;
-                            try { children = store.list(dir); } catch (IOException e) { denied++; continue; }
-                            for (FileStore.Node n : children) {
-                                if (cancel.get()) break;
-                                if (n.directory) queue.add(n);
-                                boolean match = !contents && pattern.matcher(n.name).find();
-                                if (contents && !n.directory && isText(n.name)) {
-                                    try (InputStream in = store.read(n)) {
-                                        byte[] bytes = FileStore.readBytes(in, 2 * 1024 * 1024);
-                                        match = pattern.matcher(TextCodec.decode(bytes, null).text()).find();
-                                    } catch (IOException e) { denied++; }
-                                }
-                                if (match) matches.add(n);
-                                if (matches.size() >= 2000) break;
-                            }
-                        }
-                        return new SearchResult(matches, denied, cancel.get(), matches.size() >= 2000);
-                    }, result -> {
-                        waiting.dismiss(); showSearch(result);
-                    });
+                    FileStore.Node searchRoot = scope.getSelectedItemPosition() == 1
+                            ? FileStore.directory(Environment.getExternalStorageDirectory(), false) : start;
+                    SearchJob.start(this, searchRoot, q, pattern, contents);
+                    startActivity(new Intent(this, SearchActivity.class));
                 }).show();
-    }
-    private record SearchResult(List<FileStore.Node> matches, int denied, boolean stopped, boolean limited) {}
-    private void showSearch(SearchResult result) {
-        ListView list = new ListView(this); List<String> labels = new ArrayList<>();
-        for (FileStore.Node n : result.matches) labels.add(n.name + "\n" + n.path());
-        list.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, labels));
-        String heading = result.matches.size() + " 项" + (result.stopped ? " · 已停止" : "")
-                + (result.limited ? " · 达到 2000 项上限" : "") + (result.denied > 0 ? " · 跳过 " + result.denied + " 项" : "");
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(heading).setView(list).setPositiveButton("关闭", null).create();
-        list.setOnItemClickListener((p, v, pos, id) -> {
-            FileStore.Node n = result.matches.get(pos); dialog.dismiss();
-            if (n.directory) active.navigate(n); else open(n);
-        }); dialog.show();
     }
     static boolean isText(String name) {
         return name.toLowerCase(Locale.ROOT).matches(".*\\.(txt|xml|json|smali|java|kt|gradle|properties|md|js|html|css|yml|yaml|sh|ini|cfg|log|csv)$");
@@ -944,11 +1024,26 @@ public class MainActivity extends LabActivity {
             public void afterTextChanged(Editable e) {}
         });
     }
+    private void clearSearchMarks() {
+        if (left != null) left.clearMark();
+        if (right != null) right.clearMark();
+    }
+    private static String rowIdentity(FileStore.Node node) {
+        return node.file != null ? node.path() : node.key();
+    }
+    @Override protected void onPaletteChanged() {
+        for (Pane pane : new Pane[]{left, right}) if (pane != null) {
+            pane.adapter.notifyDataSetChanged(); pane.pullEdge.invalidate();
+        }
+    }
     @Override protected void handleBack() {
+        if (active != null) active.clearMark();
+        if (sheet != null && sheet.isShowing()) { sheet.dismiss(); return; }
         if (fileMenu != null && fileMenu.isShowing()) { fileMenu.cancel(); return; }
         if (popupMenu != null && popupMenu.isShowing()) { popupMenu.dismiss(); return; }
         if (drawer != null && drawer.isShowing()) { drawer.dismiss(); return; }
-        if (!active.selected.isEmpty()) { active.selected.clear(); active.adapter.notifyDataSetChanged(); actionBar(); exitArmedAt = 0; return; }
+        if (active.rangeSelecting) { active.rangeSelecting = false; actionBar(); return; }
+        if (!active.selected.isEmpty()) { active.resetSelection(); active.selectionChanged(); exitArmedAt = 0; return; }
         FileStore.Node parent = StorageNavigation.parent(store, active.location);
         if (parent != null) { exitArmedAt = 0; active.up(); return; }
         if ((active.location.uri != null || active.location.container != null) && !active.backHistory.isEmpty()) {
@@ -963,15 +1058,17 @@ public class MainActivity extends LabActivity {
         final View indicator;
         final TextView path, empty, summary;
         final SwipeSelectListView list;
-        final SwipeRefreshLayout refresh;
+        final FrameLayout refresh;
+        final PullEdgeView pullEdge;
+        final View spinnerRing;
         final Adapter adapter;
         final List<FileStore.Node> all = new ArrayList<>(), entries = new ArrayList<>();
         final Set<String> selected = new HashSet<>();
         final ArrayDeque<FileStore.Node> backHistory = new ArrayDeque<>(), forwardHistory = new ArrayDeque<>();
         FileStore.Node location;
         String filter = "";
-        String reveal;
-        boolean regex;
+        String reveal, marked, selectionAnchor;
+        boolean regex, rangeSelecting;
         volatile int generation;
         int sort, folderCount;
         java.util.concurrent.Future<?> loading;
@@ -1001,11 +1098,16 @@ public class MainActivity extends LabActivity {
             empty = Ui.text(MainActivity.this, "读取中…", 12, Ui.MUTED); empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(12), dp(12), dp(12), dp(12));
             frame.addView(empty, new FrameLayout.LayoutParams(-1, -1)); list.setEmptyView(empty);
-            refresh = new SwipeRefreshLayout(MainActivity.this);
-            refresh.setColorSchemeColors(Ui.ACCENT);
+            pullEdge = new PullEdgeView(MainActivity.this);
+            frame.addView(pullEdge, new FrameLayout.LayoutParams(-1, dp(132), Gravity.TOP));
+            spinnerRing = new View(MainActivity.this);
+            spinnerRing.setBackground(ring(false));
+            spinnerRing.setVisibility(View.GONE);
+            FrameLayout.LayoutParams spinnerParams = new FrameLayout.LayoutParams(dp(26), dp(26));
+            spinnerParams.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP; spinnerParams.topMargin = dp(8);
+            frame.addView(spinnerRing, spinnerParams);
+            refresh = new FrameLayout(MainActivity.this);
             refresh.addView(frame);
-            refresh.setOnChildScrollUpCallback((parent, child) -> list.canScrollVertically(-1));
-            refresh.setOnRefreshListener(() -> { activate(this); reload(true); });
             addView(refresh, new LinearLayout.LayoutParams(-1, 0, 1));
             list.setSelectionListener(new SwipeSelectListView.Selection() {
                 public boolean selected(int position) {
@@ -1013,31 +1115,39 @@ public class MainActivity extends LabActivity {
                 }
                 public void change(int first, int last, boolean checked) {
                     activate(Pane.this);
+                    if (rangeSelecting && last > 0 && last <= entries.size()) { toggle(entries.get(last - 1)); return; }
                     for (int i = Math.max(1, first); i <= Math.min(last, entries.size()); i++) {
                         String key = entries.get(i - 1).key();
-                        if (checked) selected.add(key); else selected.remove(key);
+                        if (checked) { selected.add(key); selectionAnchor = key; } else selected.remove(key);
                     }
-                    adapter.notifyDataSetChanged(); actionBar();
+                    selectionChanged();
                 }
                 public void gesture(boolean active) { refresh.setEnabled(!active); }
+                public void pull(float distance) { pullEdge.setDepth(distance); }
+                public void refresh() { activate(Pane.this); reload(true); }
             });
             summary = Ui.single(MainActivity.this, "", 10, Ui.MUTED);
             summary.setPadding(dp(10), 0, dp(6), 0); summary.setBackgroundColor(Ui.PANEL);
             summary.setVisibility(GONE); addView(summary, lp(-1, 18));
-            list.setOnTouchListener((v, e) -> { if (e.getAction() == MotionEvent.ACTION_DOWN) activate(this); return false; });
+            list.setOnTouchListener((v, e) -> {
+                if (e.getAction() == MotionEvent.ACTION_DOWN) activate(this);
+                return false;
+            });
+
             list.setOnItemClickListener((p, v, pos, id) -> {
                 if (!list.isEnabled()) return;
-                activate(this); if (pos == 0) { up(); return; }
+                activate(this); clearSearchMarks(); if (pos == 0) { up(); return; }
                 FileStore.Node n = entries.get(pos - 1);
                 if (!selected.isEmpty()) toggle(n); else if (n.directory) navigate(n); else open(n);
             });
             list.setOnItemLongClickListener((p, v, pos, id) -> {
                 if (!list.isEnabled()) return true;
-                activate(this);
+                activate(this); clearSearchMarks();
                 if (pos > 0) {
                     FileStore.Node node = entries.get(pos - 1);
                     if (!selected.contains(node.key())) selected.add(node.key());
-                    adapter.notifyDataSetChanged(); actionBar(); selectionMenu();
+                    selectionAnchor = node.key(); rangeSelecting = false;
+                    selectionChanged(); selectionMenu();
                 }
                 return true;
             });
@@ -1060,8 +1170,64 @@ public class MainActivity extends LabActivity {
                 return true;
             });
         }
-        void toggle(FileStore.Node n) {
-            if (!selected.add(n.key())) selected.remove(n.key()); adapter.notifyDataSetChanged(); actionBar();
+        void resetSelection() {
+            selected.clear(); selectionAnchor = null; rangeSelecting = false;
+        }
+        /** The path identity deliberately ignores whether the listing used ROOT. */
+        void mark(FileStore.Node node) {
+            marked = rowIdentity(node);
+            adapter.notifyDataSetChanged();
+            scrollToMark();
+        }
+        void scrollToMark() {
+            if (marked == null) return;
+            for (int i = 0; i < entries.size(); i++) if (rowIdentity(entries.get(i)).equals(marked)) {
+                list.setSelectionFromTop(i + 1, dp(12)); break;
+            }
+        }
+        void clearMark() {
+            if (marked == null) return;
+            marked = null; adapter.notifyDataSetChanged();
+        }
+        void selectionChanged() {
+            if (selected.isEmpty()) { selectionAnchor = null; rangeSelecting = false; }
+            if (selectionAnchor != null && !selected.contains(selectionAnchor)) selectionAnchor = null;
+            adapter.notifyDataSetChanged();
+            if (active == this) actionBar();
+        }
+        void selectAll() {
+            rangeSelecting = false;
+            for (FileStore.Node node : entries) selected.add(node.key());
+            selectionChanged();
+        }
+        FileStore.Node selectionReference() {
+            for (FileStore.Node node : entries)
+                if (node.key().equals(selectionAnchor) && selected.contains(node.key())) return node;
+            for (FileStore.Node node : entries) if (selected.contains(node.key())) return node;
+            return null;
+        }
+        void beginRange() {
+            if (rangeSelecting) { rangeSelecting = false; actionBar(); return; }
+            FileStore.Node reference = selectionReference();
+            if (reference == null) return;
+            selectionAnchor = reference.key(); rangeSelecting = true; actionBar();
+            Tasks.toast(MainActivity.this, "以 " + reference.name + " 为起点，点击范围终点；长按连选可按条件选择");
+        }
+        void toggle(FileStore.Node node) {
+            clearSearchMarks();
+            if (rangeSelecting) {
+                int start = -1, end = -1;
+                for (int i = 0; i < entries.size(); i++) {
+                    String key = entries.get(i).key();
+                    if (key.equals(selectionAnchor)) start = i;
+                    if (key.equals(node.key())) end = i;
+                }
+                if (start >= 0 && end >= 0) for (int i = Math.min(start, end); i <= Math.max(start, end); i++)
+                    selected.add(entries.get(i).key());
+                rangeSelecting = false;
+            } else if (selected.add(node.key())) selectionAnchor = node.key();
+            else selected.remove(node.key());
+            selectionChanged();
         }
         List<FileStore.Node> chosen() {
             List<FileStore.Node> out = new ArrayList<>();
@@ -1071,18 +1237,19 @@ public class MainActivity extends LabActivity {
             exitArmedAt = 0;
             rememberPosition();
             if (location != null) backHistory.push(location); forwardHistory.clear();
-            location = StorageNavigation.location(n); selected.clear(); filter = ""; reload(false, true, 1); if (active == this) actionBar();
+            clearMark();
+            location = StorageNavigation.location(n); resetSelection(); filter = ""; reload(false, true, 1); if (active == this) actionBar();
         }
         void back() {
             if (backHistory.isEmpty()) return;
             exitArmedAt = 0;
-            rememberPosition(); forwardHistory.push(location); location = backHistory.pop(); selected.clear(); filter = "";
+            rememberPosition(); clearMark(); forwardHistory.push(location); location = backHistory.pop(); resetSelection(); filter = "";
             reload(false, true, -1); actionBar();
         }
         void forward() {
             if (forwardHistory.isEmpty()) return;
             exitArmedAt = 0;
-            rememberPosition(); backHistory.push(location); location = forwardHistory.pop(); selected.clear(); filter = "";
+            rememberPosition(); clearMark(); backHistory.push(location); location = forwardHistory.pop(); resetSelection(); filter = "";
             reload(false, true, 1); actionBar();
         }
         void up() {
@@ -1110,26 +1277,29 @@ public class MainActivity extends LabActivity {
         }
         void reload(boolean feedback, boolean allowCache, int direction) {
             if (location == null) return;
-            location = RootAccess.cachedAccess(StorageNavigation.location(location));
+            // A directory already opened as ROOT keeps that handle: upgrading it would discard the cached listing.
+            if (!location.root) location = RootAccess.cachedAccess(StorageNavigation.location(location));
             int token = ++generation; FileStore.Node current = location;
             if (loading != null) { loading.cancel(false); loading = null; }
             long started = SystemClock.uptimeMillis();
-            list.stopForNavigation();
-            if (feedback) refresh.setRefreshing(true);
+            if (feedback) list.stopForRefresh(); else list.stopForNavigation();
+            if (feedback) { spinnerRing.setAlpha(1f); spinnerRing.setScaleX(.6f); spinnerRing.setScaleY(.6f);
+                spinnerRing.setBackground(ring(true)); spinnerRing.setVisibility(VISIBLE); }
             path.setText(current.file != null ? (current.path().equals("/storage/emulated/0") ? "内部存储" : current.name)
                     : current.name);
             path.setContentDescription(current.path()); path.setTooltipText(current.path());
             DirectorySnapshot cached = allowCache ? directorySnapshots.get(current.key()) : null;
             if (cached != null && started - cached.time < 15000) {
-                show(current, cached, null, direction); refresh.setRefreshing(false); return;
+                show(current, cached, null, direction); spinnerRing.setVisibility(GONE);
+                return;
             }
             if (direction != 0) {
                 list.finishGesture(); list.setEnabled(false);
                 empty.setText("读取中…");
                 if (list.getChildCount() == 0) { list.setVisibility(GONE); empty.setVisibility(VISIBLE); }
                 else {
-                    refresh.postDelayed(() -> {
-                        if (token == generation && !list.isEnabled()) refresh.setRefreshing(true);
+                    spinnerRing.postDelayed(() -> {
+                        if (token == generation && !list.isEnabled()) spinnerRing.setVisibility(VISIBLE);
                     }, 120);
                 }
                 if (active == this) header();
@@ -1152,9 +1322,9 @@ public class MainActivity extends LabActivity {
                     int[] position = positions.get(current.key());
                     if (position != null) positions.put(loadedDirectory.key(), position);
                     if (feedback) {
-                        refresh.postDelayed(() -> { if (token == generation) refresh.setRefreshing(false); },
+                        spinnerRing.postDelayed(() -> { if (token == generation) spinnerRing.setVisibility(GONE); },
                                 Math.max(0, 380 - (SystemClock.uptimeMillis() - started)));
-                    } else refresh.setRefreshing(false);
+                    } else spinnerRing.setVisibility(GONE);
                     DirectorySnapshot snapshot = new DirectorySnapshot(result, descriptions, space, SystemClock.uptimeMillis());
                     if (message == null && result.size() <= 12000) {
                         if (directorySnapshots.size() >= 24) directorySnapshots.remove(directorySnapshots.keySet().iterator().next());
@@ -1166,6 +1336,7 @@ public class MainActivity extends LabActivity {
         }
         void show(FileStore.Node current, DirectorySnapshot snapshot, String message, int direction) {
                     list.setEnabled(true);
+                    list.animate().cancel(); list.setAlpha(1f); list.setTranslationX(0f);
                     usableSpace = snapshot.space;
                     metadata = snapshot.metadata;
                     all.clear(); all.addAll(snapshot.nodes);
@@ -1174,9 +1345,11 @@ public class MainActivity extends LabActivity {
                         selected.retainAll(existing);
                     }
                     apply();
-                    empty.setText(message != null ? message : "此目录为空");
-                    if (message != null) { status.setText("目录不可读取 · 请检查权限"); list.setVisibility(GONE); empty.setVisibility(VISIBLE); }
-                    else {
+                    empty.setText(message != null ? "无法读取：" + message : "此目录为空");
+                    if (message != null) {
+                        status.setText("目录不可读取 · 请检查权限");
+                        list.setVisibility(GONE); empty.setVisibility(VISIBLE);
+                    } else {
                         list.setVisibility(VISIBLE);
                         empty.setVisibility(GONE);
                         int[] position = positions.get(current.key());
@@ -1187,11 +1360,22 @@ public class MainActivity extends LabActivity {
                             }
                             reveal = null;
                         }
+                        scrollToMark();
                         if (!current.key().equals(recordedDirectory)) {
                             directoryPlaces.visit(current); recordedDirectory = current.key();
                         }
                     }
+                    if (direction != 0 && message == null) slideIn(direction);
                     if (active == this) actionBar();
+        }
+        void slideIn(int direction) {
+            // Only a list the user can actually see slides in; a background load or a test probe must not blank it.
+            if (direction == 0 || active != this || getWindowVisibility() != VISIBLE || !isShown()) return;
+            list.animate().cancel();
+            list.setAlpha(0f);
+            list.setTranslationX(dp(direction > 0 ? 30 : -30));
+            list.animate().alpha(1f).translationX(0f).setDuration(230)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.7f)).start();
         }
         void apply() {
             list.finishGesture();
@@ -1208,11 +1392,18 @@ public class MainActivity extends LabActivity {
                 return sort == 1 ? Long.compare(b.modified, a.modified) : sort == 2 ? Long.compare(b.size, a.size)
                         : a.name.compareToIgnoreCase(b.name);
             });
+            if (!selected.isEmpty()) {
+                Set<String> visibleKeys = new HashSet<>();
+                for (FileStore.Node node : entries) visibleKeys.add(node.key());
+                selected.retainAll(visibleKeys);
+            }
+            if (selectionAnchor != null && !selected.contains(selectionAnchor)) { selectionAnchor = null; rangeSelecting = false; }
+            if (selected.isEmpty()) rangeSelecting = false;
             adapter.notifyDataSetChanged(); int folders = 0;
             for (FileStore.Node n : entries) if (n.directory) folders++;
             folderCount = folders;
             summary.setText(folders + " 目录 · " + (entries.size() - folders) + " 文件" + (!filter.isEmpty() ? " · 过滤" : ""));
-            if (active == this) header();
+            if (active == this) { header(); actionBar(); }
         }
         private final class Adapter extends BaseAdapter {
             public int getCount() { return entries.size() + 1; }
@@ -1224,8 +1415,10 @@ public class MainActivity extends LabActivity {
                 if (reuse == null) holder = new Row();
                 else holder = (Row) reuse.getTag();
                 boolean checked = n != null && selected.contains(n.key());
+                boolean marked = n != null && rowIdentity(n).equals(Pane.this.marked);
                 holder.node = n;
                 holder.background.setColor(checked ? Ui.TINT : Ui.SURFACE);
+                holder.name.setTextColor(marked ? Ui.HIT : Ui.TEXT);
                 boolean apk = n != null && ApkInstall.isApkName(n.name);
                 boolean archive = n != null && isArchive(n.name.toLowerCase(Locale.ROOT));
                 int color = n == null || n.directory ? Ui.ICON_BG : apk ? Ui.ACCENT : archive ? Ui.GOLD : 0xff4374b3;
@@ -1238,33 +1431,52 @@ public class MainActivity extends LabActivity {
                 holder.name.setText(n == null ? ".." : n.name);
                 holder.meta.setText(n == null ? "" : metadata.get(n.key()));
                 holder.meta.setVisibility(n == null ? View.GONE : View.VISIBLE);
+                holder.bindAppBadge(n, checked);
                 return holder.row;
             }
             private final class Row {
                 final LinearLayout row = Ui.row(MainActivity.this);
                 final ImageView icon = Ui.image(MainActivity.this, R.drawable.ic_folder, Color.WHITE);
+                final FrameLayout iconFrame = new FrameLayout(MainActivity.this);
+                final ImageView appBadge = new ImageView(MainActivity.this);
                 final TextView name = Ui.single(MainActivity.this, "", 13, Ui.TEXT);
                 final TextView meta = Ui.single(MainActivity.this, "", 10, Ui.MUTED);
                 final android.graphics.drawable.GradientDrawable background = Ui.background(Ui.SURFACE, 0);
                 final android.graphics.drawable.GradientDrawable iconBackground = Ui.background(Ui.ICON_BG, dp(5));
                 FileStore.Node node;
-                int drawable;
+                int drawable, badgeGeneration;
+                void bindAppBadge(FileStore.Node entry, boolean checked) {
+                    int token = ++badgeGeneration;
+                    appBadge.setImageDrawable(null); appBadge.setVisibility(View.GONE);
+                    if (checked || !AppIcons.packageDirectory(location, entry)) return;
+                    appIcons.load(entry.name, image -> {
+                        if (isDestroyed() || token != badgeGeneration || node != entry) return;
+                        appBadge.setImageDrawable(image);
+                        appBadge.setVisibility(image == null ? View.GONE : View.VISIBLE);
+                    });
+                }
                 Row() {
                     row.setPadding(dp(5), dp(2), dp(5), dp(2));
                     row.setLayoutParams(new AbsListView.LayoutParams(-1, dp(41))); row.setTag(this);
                     row.setBackground(new android.graphics.drawable.RippleDrawable(
                             android.content.res.ColorStateList.valueOf(0x227f9991), background, null));
                     icon.setPadding(dp(5), dp(5), dp(5), dp(5)); icon.setBackground(iconBackground);
-                    row.addView(icon, lp(28, 28));
+                    iconFrame.addView(icon, new FrameLayout.LayoutParams(dp(28), dp(28), Gravity.TOP | Gravity.START));
+                    appBadge.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                    appBadge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                    appBadge.setVisibility(View.GONE);
+                    iconFrame.addView(appBadge, new FrameLayout.LayoutParams(dp(18), dp(18), Gravity.BOTTOM | Gravity.END));
+                    row.addView(iconFrame, lp(36, 36));
                     LinearLayout text = Ui.column(MainActivity.this); name.setEllipsize(TextUtils.TruncateAt.END);
                     text.addView(name, lp(-1, 21)); text.addView(meta, lp(-1, 15));
                     LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1); p.leftMargin = dp(5);
                     row.addView(text, p);
-                    icon.setOnClickListener(v -> {
+                    View.OnClickListener select = v -> {
                         if (!list.isEnabled()) return;
                         activate(Pane.this); if (node == null) up(); else toggle(node);
-                    });
-                    icon.setOnLongClickListener(v -> {
+                    };
+                    icon.setOnClickListener(select); iconFrame.setOnClickListener(select);
+                    View.OnLongClickListener drag = v -> {
                         if (node == null || !list.isEnabled()) return false;
                         activate(Pane.this);
                         List<FileStore.Node> nodes = selected.contains(node.key()) ? chosen() : List.of(node);
@@ -1272,7 +1484,8 @@ public class MainActivity extends LabActivity {
                         if (!icon.startDragAndDrop(ClipData.newPlainText("files", node.name),
                                 new View.DragShadowBuilder(row), new DragItems(Pane.this, nodes), 0)) refresh.setEnabled(true);
                         return true;
-                    });
+                    };
+                    icon.setOnLongClickListener(drag); iconFrame.setOnLongClickListener(drag);
                 }
             }
         }

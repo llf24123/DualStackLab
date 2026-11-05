@@ -117,11 +117,9 @@ public class EditorActivity extends LabActivity {
             if ("arsc".equals(mode)) return ApkTools.arscText(archive, entry).getBytes(StandardCharsets.UTF_8);
             if ("arsc-file".equals(mode)) return ApkTools.arscFileText(store.materialize(source)).getBytes(StandardCharsets.UTF_8);
             if (archive != null && entry != null) {
-                try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(archive)) {
-                    java.util.zip.ZipEntry item = zip.getEntry(entry);
-                    if (item == null) throw new IOException("归档条目不存在");
-                    if (item.getSize() <= LIMIT) return ArchiveOps.bytes(archive, entry, LIMIT);
-                }
+                long size = ArchiveOps.entrySize(archive, entry);
+                if (size < 0) throw new IOException("归档条目不存在");
+                if (size <= LIMIT) return ArchiveOps.bytes(archive, entry, LIMIT);
                 pageFile = File.createTempFile("large-entry-", ".txt", getCacheDir());
                 temporaryFiles.add(pageFile);
                 ArchiveOps.extractOne(archive, entry, pageFile);

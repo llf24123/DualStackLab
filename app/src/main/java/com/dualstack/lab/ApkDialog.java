@@ -37,14 +37,10 @@ final class ApkDialog {
                 .setPositiveButton("安装", null).create();
         dialog.setOnShowListener(v -> {
             dialog.getButton(-1).setEnabled(false);
-            dialog.getButton(-1).setOnClickListener(x -> new AlertDialog.Builder(activity).setTitle("安装方式")
-                    .setItems(new String[]{"普通安装", "静默安装（ROOT）"}, (d, which) -> {
-                        dialog.dismiss(); if (which == 0) install.run(); else silent.run();
-                    }).setNegativeButton("取消", null).show());
+            dialog.getButton(-1).setOnClickListener(x -> { dialog.dismiss(); silent.run(); });
             dialog.getButton(-3).setOnClickListener(x -> new AlertDialog.Builder(activity).setTitle("APK 功能")
-                    .setItems(new String[]{"APK 编辑工具", "静默安装（ROOT）", "复制全部信息"}, (d, which) -> {
+                    .setItems(new String[]{"APK 编辑工具", "复制全部信息"}, (d, which) -> {
                         if (which == 0) { dialog.dismiss(); tools.run(); }
-                        else if (which == 1) { dialog.dismiss(); silent.run(); }
                         else {
                             StringBuilder text = new StringBuilder(name.getText() + "\n" + version.getText());
                             fields.forEach((key, value) -> text.append('\n').append(key).append(": ").append(value.getText()));
@@ -99,6 +95,7 @@ final class ApkDialog {
     private record Info(File file, PackageInfo info, String label, android.graphics.drawable.Drawable icon) {}
     private static long code(PackageInfo info) { return android.os.Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode; }
     static String[] inspect(File file, int min) throws Exception {
+        if (ArchiveOps.isRar(file)) throw new IOException("文件是 RAR 归档，不是 APK");
         ApkVerifier.Result verified = new ApkVerifier.Builder(file).setMinCheckedPlatformVersion(Math.max(26, min)).build().verify();
         List<String> schemes = new ArrayList<>();
         if (verified.isVerifiedUsingV1Scheme()) schemes.add("V1"); if (verified.isVerifiedUsingV2Scheme()) schemes.add("V2");

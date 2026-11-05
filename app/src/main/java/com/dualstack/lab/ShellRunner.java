@@ -23,6 +23,12 @@ final class ShellRunner {
 
     Result run(String command, File directory, boolean root, long timeoutMillis,
                Consumer<String> listener, boolean interactive) throws IOException {
+        return run(command, directory, root, timeoutMillis, listener, interactive, null);
+    }
+
+    /** {@code stdin}, when given, is pumped into the command's stdin and then closed. */
+    Result run(String command, File directory, boolean root, long timeoutMillis,
+               Consumer<String> listener, boolean interactive, InputStream stdin) throws IOException {
         this.root = root;
         ProcessBuilder builder;
         if (directory != null && !root && !directory.isDirectory()) throw new IOException("工作目录不存在：" + directory);
@@ -48,7 +54,14 @@ final class ShellRunner {
             try { process = builder.start(); }
             catch (IOException e) { throw new IOException(root ? "无法启动 su；设备需已 ROOT 并允许授权" : "无法启动系统 Shell", e); }
             if (stopped) stop();
-            if (!interactive) process.getOutputStream().close();
+            if (stdin != null) {
+                // Pump separately: a command that writes more than the pipe buffer would otherwise deadlock.
+                Thread feeder = new Thread(() -> {
+                    try (OutputStream out = process.getOutputStream(); InputStream source = stdin) { FileStore.pump(source, out); }
+                    catch (IOException failure) { outputFailure.compareAndSet(null, failure); stop(); }
+                }, "shell-input");
+                feeder.setDaemon(true); feeder.start();
+            } else if (!interactive) process.getOutputStream().close();
             Thread reader = new Thread(() -> {
                 try (Reader input = new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)) {
                     char[] buffer = new char[4096]; int count;

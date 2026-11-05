@@ -18,6 +18,8 @@ final class RootShell {
     }
 
     static List<String> arguments(String command, String help) {
+        // MT-style preference: init's mount namespace keeps system and module views identical.
+        if (help.contains("--target")) return List.of("su", "--target", "1", "-c", command);
         return help.contains("--mount-master") ? List.of("su", "--mount-master", "-c", command)
                 : List.of("su", "-c", command);
     }
