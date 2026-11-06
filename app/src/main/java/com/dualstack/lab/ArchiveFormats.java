@@ -84,6 +84,7 @@ final class ArchiveFormats {
                 while ((entry = input.getNextEntry()) != null) {
                     String path = path(entry, input);
                     if (path.isEmpty()) continue;
+                    Tasks.Progress.step(path);
                     String normalized = path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
                     if (!requested.isEmpty() && !normalized.equals(requested)
                             && !(requested.endsWith("/") && path.startsWith(requested))) continue;
@@ -146,6 +147,7 @@ final class ArchiveFormats {
 
     private static void packNode(FileStore store, FileStore.Node node, String path, TarArchiveOutputStream output,
                                  Set<String> seen, Set<String> written, int depth) throws IOException {
+        Tasks.Progress.step(path);
         ArchiveOps.validateEntry(path);
         if (node.file != null && Files.isSymbolicLink(node.file.toPath()))
             throw new IOException("TAR 压缩不跟随符号链接：" + path);
@@ -234,6 +236,7 @@ final class ArchiveFormats {
                 while ((item = archive.getNextEntry()) != null) {
                     String path = sevenPath(item);
                     if (path.isEmpty()) continue;
+                    Tasks.Progress.step(path);
                     String normalized = path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
                     if (!requested.isEmpty() && !normalized.equals(requested)
                             && !(requested.endsWith("/") && path.startsWith(requested))) continue;
@@ -278,6 +281,7 @@ final class ArchiveFormats {
 
     private static void packSevenZNode(FileStore store, FileStore.Node node, String path,
             SevenZOutputFile output, Set<String> seen, Set<String> written, int depth) throws IOException {
+        Tasks.Progress.step(path);
         ArchiveOps.validateEntry(path);
         String key = node.file != null ? node.file.getCanonicalPath() : node.key();
         if (depth > 256 || !seen.add(key)) throw new IOException("目录包含循环引用或嵌套过深");

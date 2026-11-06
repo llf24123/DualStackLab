@@ -96,6 +96,7 @@ final class RarArchiveOps {
         try (Archive archive = open(file)) {
             for (FileHeader header : archive.getFileHeaders()) {
                 String path = normalize(header.getFileName());
+                Tasks.Progress.step(path);
                 checkNoLink(header);
                 boolean directory = header.isDirectory() || path.endsWith("/");
                 String normalized = directory && path.endsWith("/") ? path.substring(0, path.length() - 1) : path;

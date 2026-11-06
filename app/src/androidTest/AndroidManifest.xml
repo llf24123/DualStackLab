@@ -1,6 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <application>
+        <receiver android:name="com.dualstack.lab.CountingDocumentsProvider$GrantReceiver"
+            android:exported="true" />
+        <provider android:name="com.dualstack.lab.CountingDocumentsProvider"
+            android:authorities="com.dualstack.lab.test.documents"
+            android:permission="android.permission.MANAGE_DOCUMENTS"
+            android:exported="true" android:grantUriPermissions="true" />
         <provider android:name="com.dualstack.lab.ExternalFixtureProvider"
             android:authorities="com.dualstack.lab.test.external"
             android:exported="true" android:grantUriPermissions="true" />

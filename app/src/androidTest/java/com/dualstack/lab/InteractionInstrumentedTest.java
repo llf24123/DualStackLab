@@ -109,6 +109,38 @@ public class InteractionInstrumentedTest {
         find(By.text(file.getName())).click(); find(By.text("inside.txt")); capture("external-zip");
         device.pressBack(); find(By.desc("双栈 Lab · " + left.getPath()));
     }
+    @Test public void archiveNavigationShowsItsLocationBeforeTheIndexFinishes() throws Exception {
+        zip(); main(); find(By.text("external.zip"));
+        java.util.concurrent.CountDownLatch locked = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        Tasks.IO.execute(() -> {
+            synchronized (ArchiveOps.class) {
+                locked.countDown();
+                try { release.await(10, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+        });
+        assertTrue(locked.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        try {
+            find(By.text("external.zip")).click();
+            boolean[] entered = {false};
+            long deadline = SystemClock.uptimeMillis() + 2000;
+            while (!entered[0] && SystemClock.uptimeMillis() < deadline) {
+                scenario.onActivity(a -> {
+                    try {
+                        java.lang.reflect.Field leftField = MainActivity.class.getDeclaredField("left"); leftField.setAccessible(true);
+                        Object pane = leftField.get(a);
+                        java.lang.reflect.Field location = pane.getClass().getDeclaredField("location"); location.setAccessible(true);
+                        entered[0] = ((FileStore.Node) location.get(pane)).container != null;
+                    } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
+                });
+                if (!entered[0]) SystemClock.sleep(20);
+            }
+            assertTrue("Navigation waited for a redundant preflight listing", entered[0]);
+        } finally { release.countDown(); }
+        find(By.text("inside.txt"));
+        device.pressBack(); find(By.text("external.zip"));
+    }
     @Test public void externalFileProviderNavigatesToOriginalWithoutImport() throws Exception {
         File shared = new File(context.getCacheDir(), "shared"); shared.mkdirs();
         File file = new File(shared, "stream.zip"); Files.copy(zip().toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
@@ -229,6 +261,19 @@ public class InteractionInstrumentedTest {
         assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
         swipeRow(false, "one.txt", true); find(By.desc("取消"));
         swipeRow(false, "one.txt", false); assertTrue(device.wait(Until.gone(By.desc("取消")), 5000));
+    }
+    @Test public void shortOrSlantedStrokesDoNotStartSelection() throws Exception {
+        for (int i = 0; i < 30; i++) Files.write(new File(left, String.format(java.util.Locale.ROOT, "row-%02d.txt", i)).toPath(), new byte[]{65});
+        main(); find(By.text("row-05.txt"));
+        android.graphics.Rect bounds = find(By.desc("左窗口文件列表")).getVisibleBounds();
+        int y = find(By.text("row-05.txt")).getVisibleBounds().centerY(), x = bounds.left + bounds.width() / 3;
+        assertTrue("Short sideways nudge", device.swipe(x, y, x + Ui.dp(context, 30), y, 12));
+        assertFalse("A short sideways stroke opened the file", device.hasObject(By.desc("保存")));
+        assertTrue("Slanted scroll", device.swipe(x, y, x + Ui.dp(context, 60), y - Ui.dp(context, 45), 18));
+        SystemClock.sleep(400);
+        assertFalse("A short or slanted stroke selected a row", device.hasObject(By.desc("取消")));
+        assertTrue("Deliberate swipe", device.swipe(x, y, bounds.left + bounds.width() * 86 / 100, y, 18));
+        find(By.desc("取消"));
     }
     @Test public void horizontalThenVerticalStrokeSelectsRangeAndCanClearIt() throws Exception {
         for (int i = 0; i < 3; i++) Files.write(new File(left, "row-" + i + ".txt").toPath(), ("row" + i).getBytes());

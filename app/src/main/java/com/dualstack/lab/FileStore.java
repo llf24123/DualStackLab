@@ -116,7 +116,7 @@ final class FileStore {
         parent = RootAccess.automatic(parent);
         List<Node> out = new ArrayList<>();
         if (parent.container != null) {
-            File archive = materialize(parent.container);
+            File archive = archiveView(parent.container);
             try {
                 for (ArchiveOps.Item item : ArchiveOps.list(archive, parent.entry))
                     out.add(archiveNode(parent.container, item.path(), item.directory(), item.size(), item.modified()));
@@ -187,7 +187,7 @@ final class FileStore {
     InputStream read(Node requested) throws IOException {
         Node node = RootAccess.automatic(requested);
         if (node.container != null) {
-            File archive = materialize(node.container);
+            File archive = archiveView(node.container);
             try {
                 return new FilterInputStream(ArchiveOps.openEntry(archive, node.entry)) {
                     @Override public void close() throws IOException {
@@ -215,7 +215,18 @@ final class FileStore {
             }
         };
     }
+    void checkWritable(Node node) throws IOException {
+        while (node.container != null) node = node.container;
+        node = RootAccess.automatic(node);
+        if (node.file == null) return;
+        if (node.root) {
+            String path = quote(node.path());
+            shell("if [ -L " + path + " ]; then printf '%s\\n' '不能直接保存符号链接，请打开真实文件' >&2; exit 1; fi; "
+                    + "test -f " + path, true);
+        } else FileState.read(node.file);
+    }
     void write(Node node, File content) throws IOException {
+        checkWritable(node);
         node = RootAccess.automatic(node);
         if (node.container != null) {
             editArchive(node.container, null, null, Map.of(node.entry, content));
@@ -228,21 +239,29 @@ final class FileStore {
         } else if (node.root) {
             applyRoot(content, node);
         } else {
+            FileState before = FileState.read(node.file);
             File tmp = File.createTempFile(".dualstack-", ".tmp", node.file.getParentFile());
             try {
                 Files.copy(content.toPath(), tmp.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                replace(tmp, node.file);
+                publish(tmp, node.file, before);
             } finally { Files.deleteIfExists(tmp.toPath()); }
         }
+        if (node.file != null) ArchiveOps.forget(node.file);
     }
     /** Publish only a complete payload, preserving the original mode and owner. */
-    private void applyRoot(File staged, Node node) throws IOException {
+    private String applyRoot(File staged, Node node) throws IOException {
+        return applyRoot(new FileInputStream(staged), staged.length(), node);
+    }
+    /** The command checks the written size against {@code size} before publishing, so a short stream never replaces data. */
+    private String applyRoot(InputStream payload, long size, Node node) throws IOException {
         String temporary = node.path() + ".dualstack-" + UUID.randomUUID();
-        String command = rootWriteCommand(node.path(), temporary, staged.length());
-        try (InputStream input = new FileInputStream(staged)) {
+        String command = rootWriteCommand(node.path(), temporary, size);
+        try (InputStream input = payload) {
             ShellRunner.Result result = new ShellRunner().run(command, null, true, 300000, null, true, input);
             if (result.timedOut()) throw new IOException("ROOT 写入超时");
             if (result.exitCode() != 0) throw new IOException("ROOT 写入失败\n" + result.output());
+            String[] lines = result.output().trim().split("\n");
+            return lines[lines.length - 1].trim();
         } finally {
             shell("/system/bin/toybox rm -f -- " + quote(temporary), true);
         }
@@ -252,6 +271,10 @@ final class FileStore {
         parent = RootAccess.automatic(parent);
         checkName(name);
         for (Node n : list(parent)) if (name.equals(n.name)) throw new IOException("同名文件已存在");
+        return createAbsent(parent, name, directory);
+    }
+    private Node createAbsent(Node parent, String name, boolean directory) throws IOException {
+        checkName(name);
         if (parent.container != null) {
             String entry = parent.entry + name + (directory ? "/" : "");
             Map<String, File> additions = new HashMap<>(); additions.put(entry, null);
@@ -268,7 +291,7 @@ final class FileStore {
         if (parent.root) {
             String path = quote(f.getAbsolutePath()), container = quote(parent.file.getAbsolutePath());
             // Inherit the parent's owner so FUSE-visible entries stay owned by the storage user, not ROOT.
-            shell((directory ? "mkdir " : "touch ") + path + " || exit 1;"
+            shell((directory ? "mkdir " + path : "(set -C; : > " + path + ")") + " || exit 1;"
                     + " owner=$(/system/bin/toybox stat -c '%u:%g' " + container + " 2>/dev/null);"
                     + " [ -n \"$owner\" ] && /system/bin/toybox chown \"$owner\" " + path + " 2>/dev/null; exit 0", true);
             return new Node(name, f, null, directory, true, 0, System.currentTimeMillis());
@@ -399,6 +422,16 @@ final class FileStore {
         });
     }
     Node copy(Node source, Node parent, boolean move) throws IOException {
+        return copy(source, parent, move, new HashMap<>());
+    }
+    List<Node> copyAll(Collection<Node> sources, Node parent, boolean move) throws IOException {
+        if (move) for (Node source : sources) checkRemoval(source);
+        Map<String, Set<String>> names = new HashMap<>();
+        List<Node> copied = new ArrayList<>();
+        for (Node source : sources) copied.add(copy(source, parent, move, names));
+        return copied;
+    }
+    private Node copy(Node source, Node parent, boolean move, Map<String, Set<String>> names) throws IOException {
         if (move) checkRemoval(source);
         source = RootAccess.automatic(source);
         parent = RootAccess.automatic(parent);
@@ -433,9 +466,17 @@ final class FileStore {
                 child = DocumentsContract.isChildDocument(context.getContentResolver(), source.uri, parent.uri);
             if (child) throw new IOException("不能复制到自己的子目录");
         }
-        String name = unique(parent, source.name);
+        if (move && source.file != null && parent.file != null
+                && source.file.getParentFile().getCanonicalFile().equals(parent.file.getCanonicalFile())) return source;
+        Set<String> used = names.get(parent.key());
+        if (used == null) {
+            used = new HashSet<>();
+            for (Node child : list(parent)) used.add(child.name);
+            names.put(parent.key(), used);
+        }
+        String name = unique(used, source.name);
+        used.add(name);
         if (move && source.file != null && parent.file != null) {
-            if (source.file.getParentFile().getCanonicalFile().equals(parent.file.getCanonicalFile())) return source;
             File destination = new File(parent.file, name);
             if (source.root || parent.root) {
                 String from = quote(source.path()), to = quote(destination.getAbsolutePath());
@@ -467,11 +508,14 @@ final class FileStore {
             if (move) delete(source);
             return archiveNode(parent.container, entry, source.directory, source.size, source.modified);
         }
-        Node made = create(parent, name, source.directory);
+        Node made = createAbsent(parent, name, source.directory);
+        used.add(made.name);
+        CopyLedger ledger = new CopyLedger();
         try {
-            copyContent(source, made, new HashSet<>());
+            ledger.record(made);
+            copyContent(source, made, new HashSet<>(), ledger);
         } catch (IOException | RuntimeException e) {
-            try { delete(made); } catch (IOException cleanup) { e.addSuppressed(cleanup); }
+            ledger.rollback(e);
             throw e;
         }
         if (move) delete(source);
@@ -479,6 +523,7 @@ final class FileStore {
     }
     private void archiveAdditions(Node source, String entry, Map<String, File> additions, Map<Node, File> staged,
                                   Set<String> seen) throws IOException {
+        Tasks.Progress.step(source.name);
         String key = source.file != null ? source.file.getCanonicalPath() : source.key();
         if (!seen.add(key)) throw new IOException("目录包含循环引用");
         if (source.directory) {
@@ -489,21 +534,63 @@ final class FileStore {
         }
         seen.remove(key);
     }
-    private void copyContent(Node source, Node target, Set<String> seen) throws IOException {
+    private final class CopyLedger {
+        private final Map<Node, String> created = new LinkedHashMap<>();
+        void record(Node node) throws IOException { created.put(node, identity(node)); }
+        void published(Node node, String identity) { created.put(node, identity); }
+        private String identity(Node node) throws IOException {
+            if (node.file == null) return node.key();
+            try {
+                android.system.StructStat stat = android.system.Os.lstat(node.path());
+                return stat.st_dev + ":" + stat.st_ino;
+            } catch (android.system.ErrnoException error) {
+                if (!node.root) throw new IOException(error);
+                return shell("/system/bin/toybox stat -c '%d:%i' " + quote(node.path()), true).trim();
+            }
+        }
+        void rollback(Exception failure) {
+            List<Node> nodes = new ArrayList<>(created.keySet());
+            Collections.reverse(nodes);
+            for (Node node : nodes) try {
+                if (!created.get(node).equals(identity(node))) continue;
+                if (node.uri != null) {
+                    if (!node.directory || list(node).isEmpty()) {
+                        if (!DocumentsContract.deleteDocument(context.getContentResolver(), node.uri))
+                            throw new IOException("无法清理未完成的复制：" + node.name);
+                    }
+                } else if (node.root) {
+                    shell("/system/bin/toybox " + (node.directory ? "rmdir" : "rm -f") + " -- " + quote(node.path()), true);
+                } else Files.deleteIfExists(node.file.toPath());
+            } catch (IOException | RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+        }
+    }
+    private void copyContent(Node source, Node target, Set<String> seen, CopyLedger ledger) throws IOException {
+        Tasks.Progress.step(source.name);
         String key = source.file != null ? source.file.getCanonicalPath() : source.key();
         if (!seen.add(key)) throw new IOException("目录包含循环引用");
         if (source.directory) {
-            for (Node n : list(source)) copyContent(n, create(target, n.name, n.directory), seen);
+            for (Node n : list(source)) {
+                Node made = createAbsent(target, n.name, n.directory);
+                ledger.record(made);
+                copyContent(n, made, seen, ledger);
+            }
         } else {
             // Targets are newly created; direct streaming needs no second complete cache copy.
-            target = RootAccess.automatic(target);
             if (target.root) {
-                // Stream through app storage so ROOT never leaves a root-owned file in shared storage.
-                File staged = File.createTempFile("root-copy-", ".tmp", context.getCacheDir());
-                try {
-                    try (InputStream in = read(source); OutputStream out = new FileOutputStream(staged)) { pump(in, out); }
-                    applyRoot(staged, target);
-                } finally { Files.deleteIfExists(staged.toPath()); }
+                if (source.file != null && !source.root && source.container == null && source.file.isFile()) {
+                    // A plain readable file has a reliable length, so it streams straight into the verified ROOT write.
+                    long size = source.file.length();
+                    try (InputStream in = new BufferedInputStream(new FileInputStream(source.file))) {
+                        ledger.published(target, applyRoot(in, size, target));
+                    }
+                } else {
+                    // Other sources report unreliable sizes; stage them so the ROOT write can verify the full payload.
+                    File staged = File.createTempFile("root-copy-", ".tmp", context.getCacheDir());
+                    try {
+                        try (InputStream in = read(source); OutputStream out = new FileOutputStream(staged)) { pump(in, out); }
+                        ledger.published(target, applyRoot(staged, target));
+                    } finally { Files.deleteIfExists(staged.toPath()); }
+                }
             } else try (InputStream in = read(source);
                         OutputStream out = target.uri != null
                                 ? context.getContentResolver().openOutputStream(target.uri, "wt")
@@ -530,7 +617,7 @@ final class FileStore {
                     else {
                         staged = Files.createTempDirectory(context.getCacheDir().toPath(), "extract-").toFile();
                         ArchiveOps.extract(archive, "", staged);
-                        for (Node child : list(local(staged))) copy(child, output, false);
+                        copyAll(list(local(staged)), output, false);
                     }
                 } finally { release(source, archive); }
             } else {
@@ -543,7 +630,7 @@ final class FileStore {
                         ArchiveOps.extract(archive, source.entry, staged, true);
                     } finally { release(source.container, archive); }
                 }
-                for (Node child : list(local(staged))) copy(child, output, false);
+                copyAll(list(local(staged)), output, false);
             }
             return output;
         } catch (IOException | RuntimeException error) {
@@ -554,6 +641,9 @@ final class FileStore {
     String unique(Node parent, String original) throws IOException {
         Set<String> names = new HashSet<>();
         for (Node n : list(parent)) names.add(n.name);
+        return unique(names, original);
+    }
+    private static String unique(Set<String> names, String original) {
         if (!names.contains(original)) return original;
         int dot = original.lastIndexOf('.');
         String base = dot > 0 ? original.substring(0, dot) : original;
@@ -575,8 +665,15 @@ final class FileStore {
     void release(Node source, File file) throws IOException {
         if (source.file == null || !source.file.equals(file)) {
             ArchiveOps.clearPassword(file);
+            ArchiveOps.forget(file);
             Files.deleteIfExists(file.toPath());
         }
+    }
+    File archiveView(Node container) throws IOException {
+        Node node = RootAccess.automatic(container);
+        if (node.file != null && node.container == null && node.file.isFile() && node.file.canRead()) return node.file;
+        // Protected and provider-backed inputs keep private lifetimes; metadata alone cannot prove their freshness.
+        return materialize(node);
     }
     private static void checkRemoval(Node node) throws IOException {
         if (node.file != null && RootAccess.protectedStorageDirectory(node.file))
@@ -584,6 +681,7 @@ final class FileStore {
     }
     private void editArchive(Node source, String remove, String rename, Map<String, File> additions) throws IOException {
         synchronized (ArchiveOps.class) {
+            checkWritable(source);
             source = RootAccess.automatic(source);
             File archive = materialize(source);
             try {
@@ -619,6 +717,33 @@ final class FileStore {
             left--;
         }
     }
+    record FileState(long device, long inode, long size, long modified, int mode, int uid, int gid) {
+        static FileState read(File file) throws IOException {
+            try {
+                android.system.StructStat stat = android.system.Os.lstat(file.getAbsolutePath());
+                if (android.system.OsConstants.S_ISLNK(stat.st_mode))
+                    throw new IOException("不能直接保存符号链接，请打开真实文件");
+                if (!android.system.OsConstants.S_ISREG(stat.st_mode)) throw new IOException("保存目标不是普通文件");
+                return new FileState(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime,
+                        stat.st_mode & 07777, stat.st_uid, stat.st_gid);
+            } catch (android.system.ErrnoException error) { throw new IOException(error); }
+        }
+    }
+    static void publish(File tmp, File target, FileState before) throws IOException {
+        try {
+            FileState staged = FileState.read(tmp);
+            if ((staged.mode & 0200) == 0) android.system.Os.chmod(tmp.getAbsolutePath(), staged.mode | 0200);
+            try (RandomAccessFile output = new RandomAccessFile(tmp, "rw")) { output.getFD().sync(); }
+            if (staged.uid != before.uid || staged.gid != before.gid)
+                android.system.Os.chown(tmp.getAbsolutePath(), before.uid, before.gid);
+            if (FileState.read(tmp).mode != before.mode) android.system.Os.chmod(tmp.getAbsolutePath(), before.mode);
+            FileState ready = FileState.read(tmp);
+            if (ready.uid != before.uid || ready.gid != before.gid || ready.mode != before.mode)
+                throw new IOException("无法保留原文件权限，原文件未替换");
+            if (!before.equals(FileState.read(target))) throw new IOException("保存目标已在外部改变，请重新打开");
+            Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (android.system.ErrnoException error) { throw new IOException(error); }
+    }
     static void replace(File tmp, File to) throws IOException {
         try { Files.move(tmp.toPath(), to.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); }
         catch (java.nio.file.AtomicMoveNotSupportedException e) {
@@ -634,11 +759,19 @@ final class FileStore {
     static String rootWriteCommand(String path, String temporary) { return rootWriteCommand(path, temporary, -1); }
     static String rootWriteCommand(String path, String temporary, long size) {
         String source = quote(path), tmp = quote(temporary);
-        String verify = size < 0 ? "" : " && [ \"$(stat -c %s " + tmp + ")\" = " + size + " ]";
-        return "(set -C; cat > " + tmp + ")" + verify
-                + " && chmod \"$(stat -c %a " + source + ")\" " + tmp
-                + " && chown \"$(stat -c %u:%g " + source + ")\" " + tmp
-                + " && mv " + tmp + " " + source + " || { rm -f " + tmp + "; exit 1; }";
+        String stat = "/system/bin/toybox stat";
+        String identity = stat + " -c '%d:%i:%s:%Y:%a:%u:%g' " + source;
+        String verify = size < 0 ? "" : " && [ \"$(" + stat + " -c %s " + tmp + ")\" = " + size + " ]";
+        return "if [ -L " + source + " ]; then printf '%s\\n' '不能直接保存符号链接，请打开真实文件' >&2; exit 1; fi; "
+                + "test -f " + source + " || exit 1; before=$(" + identity + ") || exit 1; "
+                + "mode=$(" + stat + " -c %a " + source + ") && owner=$(" + stat + " -c '%u:%g' " + source + ") || exit 1; "
+                + "(set -C; : > " + tmp + ") || exit 1; "
+                + "{ cat > " + tmp + verify
+                + " && chown \"$owner\" " + tmp + " && chmod \"$mode\" " + tmp
+                + " && [ \"$(" + stat + " -c '%a:%u:%g' " + tmp + ")\" = \"$mode:$owner\" ]"
+                + " && test ! -L " + source + " && [ \"$(" + identity + ")\" = \"$before\" ]"
+                + " && published=$(" + stat + " -c '%d:%i' " + tmp + ")"
+                + " && mv " + tmp + " " + source + " && printf '%s\\n' \"$published\"; } || { rm -f " + tmp + "; exit 1; }";
     }
     static String shell(String command, boolean root) throws IOException {
         ShellRunner.Result result = new ShellRunner().run(command, null, root, 45000, null, false);

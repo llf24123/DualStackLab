@@ -349,9 +349,10 @@ public class UiWorkflowTest {
         clickText("正则表达式"); clickText("应用");
         await(() -> pane(true).hasObject(By.text("drag.txt")) && !pane(true).hasObject(By.text("other.json")));
         clickDescription("更多操作"); clickText("搜索");
-        find(By.clazz("android.widget.EditText")).setText("drag\\.txt");
-        clickText("正则表达式");
-        find(By.res("android:id/button1")).click();
+        find(By.desc("搜索关键词")).setText("drag\\.txt");
+        if (!find(By.desc("正则表达式")).isSelected()) clickDescription("正则表达式");
+        if (find(By.desc("搜索范围：文件名或内容")).getText().equals("文件内容")) clickDescription("搜索范围：文件名或内容");
+        clickDescription("开始搜索");
         findLong(By.textContains("1 项"));
         findLong(By.text("drag.txt")); clickDescription("返回");
     }
@@ -363,13 +364,13 @@ public class UiWorkflowTest {
         ActivityScenario<EditorActivity> editorScenario = ActivityScenario.launch(intent); scenario = editorScenario;
         await(() -> device.hasObject(By.textContains("UTF-8")));
         clickDescription("查找与替换");
-        find(By.clazz("android.widget.EditText"));
+        find(By.desc("查找内容"));
         List<UiObject2> inputs = device.findObjects(By.clazz("android.widget.EditText"));
         inputs.get(0).setText("one \\d+"); inputs.get(1).setText("done");
-        clickText("正则表达式"); device.waitForIdle();
+        clickDescription("正则表达式"); device.waitForIdle();
         // The editor searches asynchronously; wait for its worker before replacing.
         Thread.sleep(350);
-        clickText("全部替换"); clickText("关闭");
+        clickText("全部替换"); clickDescription("关闭查找");
         await(() -> editorText(editorScenario).equals("done\ndone\n"));
         clickDescription("撤销 / 上一页");
         await(() -> editorText(editorScenario).equals("one 12\none 34\n"));
@@ -411,6 +412,8 @@ public class UiWorkflowTest {
             catch (IOException e) { return false; }
         });
         clickDescription("返回");
+        // A save still finishing keeps the editor open briefly; its title also reads renamed.txt.
+        await(() -> !device.hasObject(By.desc("编辑器菜单")));
         longClickText("renamed.txt"); clickText("删除"); clickText("删除");
         await(() -> {
             try (ZipFile archive = new ZipFile(zip)) { return archive.getEntry("renamed.txt") == null; }

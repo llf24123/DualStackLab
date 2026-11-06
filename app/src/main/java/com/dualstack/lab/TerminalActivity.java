@@ -139,20 +139,22 @@ public class TerminalActivity extends LabActivity {
 
     private void prepare() {
         preparing = true;
+        boolean requestedRoot = useRoot;
         Tasks.run(this, () -> {
-            if (useRoot) RootShell.capabilities();
+            if (requestedRoot) RootShell.capabilities();
             ExecutableFile.Prepared file = ExecutableFile.prepare(this, new FileStore(this).fromIntent(getIntent()),
                     getIntent().getBooleanExtra("forceScript", false));
+            boolean available = file.elf() != null && !requestedRoot && rootAvailable();
             synchronized (this) {
                 if (disposed) { file.close(); return null; }
                 prepared = file;
             }
-            return file;
-        }, file -> {
-            if (file == null) return;
-            if (file.elf() != null) {
+            return new Launch(file, available);
+        }, launch -> {
+            if (launch == null) return;
+            if (launch.file().elf() != null) {
                 pipe = false;
-                if (!useRoot) useRoot = rootAvailable();
+                if (!useRoot) useRoot = launch.rootAvailable();
             }
             preparing = false; runFile();
         }, error -> {
@@ -164,6 +166,7 @@ public class TerminalActivity extends LabActivity {
                     }).show();
         });
     }
+    private record Launch(ExecutableFile.Prepared file, boolean rootAvailable) {}
     private boolean rootAvailable() {
         try {
             ShellRunner.Result result = new ShellRunner().run("/system/bin/toybox id -u", null, true, 5000, null, false);

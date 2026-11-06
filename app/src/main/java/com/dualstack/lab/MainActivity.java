@@ -34,7 +34,7 @@ public class MainActivity extends LabActivity {
     private long exitArmedAt;
     private int externalGeneration;
     private String handledExternal;
-    private boolean showHidden;
+    private boolean showHidden, comfortable;
     private boolean busy, resumed;
     private Boolean selectionActions;
     private final Map<String, DirectorySnapshot> directorySnapshots = new LinkedHashMap<>(24, .75f, true);
@@ -48,6 +48,7 @@ public class MainActivity extends LabActivity {
         if (saved != null && saved.getString("pendingInstall") != null) pendingInstall = new File(saved.getString("pendingInstall"));
         directoryPlaces = new DirectoryPlaces(this);
         showHidden = getPreferences(0).getBoolean("showHidden", true);
+        comfortable = getPreferences(0).getBoolean("comfortable", false);
         LinearLayout root = Ui.column(this);
         LinearLayout top = Ui.row(this);
         top.setBackgroundColor(Ui.INK);
@@ -98,6 +99,7 @@ public class MainActivity extends LabActivity {
         restore(left, saved); restore(right, saved);
         if (saved != null) handledExternal = saved.getString("handledExternal");
         if (saved == null || ExternalFiles.uri(getIntent()) != null) navigateIntent(getIntent());
+        if (saved == null) EditorDrafts.WORKER.execute(() -> EditorDrafts.prune(getApplicationContext(), 14L * 24 * 60 * 60 * 1000));
     }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent); externalGeneration++; handledExternal = null; navigateIntent(intent);
@@ -219,21 +221,19 @@ public class MainActivity extends LabActivity {
         }
     }
     private int dp(int n) { return Ui.dp(this, n); }
-    /** Small halo shown under a pulled list; it fills in once the release would refresh. */
-    private android.graphics.drawable.GradientDrawable ring(boolean armed) {
-        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
-        shape.setShape(android.graphics.drawable.GradientDrawable.OVAL);
-        shape.setColor(0x00000000);
-        shape.setStroke(dp(2), armed ? Ui.ACCENT : Ui.TEXT);
-        return shape;
+    /** Row sizes follow the user's font scale so larger system text is not clipped. */
+    private int scaled(int n) {
+        return Math.round(dp(n) * Math.max(1f, getResources().getConfiguration().fontScale));
     }
+    private int rowHeight() { return Math.max(dp(comfortable ? 52 : 41), scaled(comfortable ? 52 : 41)); }
     private LinearLayout.LayoutParams lp(int w, int h) {
         return new LinearLayout.LayoutParams(w < 0 ? w : dp(w), h < 0 ? h : dp(h));
     }
     private void activate(Pane p) {
         if (active == p) return;
-        active = p; left.indicator.setBackgroundColor(p == left ? Ui.ACCENT : Ui.LINE);
-        right.indicator.setBackgroundColor(p == right ? Ui.ACCENT : Ui.LINE);
+        active = p;
+        Ui.fadeBackground(left.indicator, p == left ? Ui.ACCENT : Ui.LINE);
+        Ui.fadeBackground(right.indicator, p == right ? Ui.ACCENT : Ui.LINE);
         header(); actionBar();
     }
     private void header() {
@@ -251,8 +251,10 @@ public class MainActivity extends LabActivity {
         boolean selection = !active.selected.isEmpty();
         if (!selection) { active.rangeSelecting = false; active.selectionAnchor = null; }
         boolean rebuild = selectionActions == null || selectionActions != selection;
+        boolean modeChanged = selectionActions != null && rebuild;
         selectionActions = selection;
         if (rebuild) actions.removeAllViews();
+        if (modeChanged && actions.isShown()) Ui.fadeIn(actions);
         status.setVisibility(active.selected.isEmpty() && !busy ? View.GONE : View.VISIBLE);
         if (selection) {
             if (rebuild) {
@@ -406,15 +408,25 @@ public class MainActivity extends LabActivity {
                 }).show();
     }
     private void settings() {
-        new AlertDialog.Builder(this).setTitle("设置").setItems(new String[]{"主题", "隐藏文件", "恢复默认首页"}, (d, n) -> {
+        new AlertDialog.Builder(this).setTitle("设置").setItems(new String[]{"主题", "隐藏文件", "列表密度", "恢复默认首页"}, (d, n) -> {
             if (n == 0) Ui.chooseTheme(this);
             else if (n == 1) hiddenOptions();
+            else if (n == 2) densityOptions();
             else new AlertDialog.Builder(this).setTitle("恢复默认首页？").setMessage("左右窗口下次启动都会回到内部存储。")
                     .setNegativeButton("取消", null).setPositiveButton("恢复", (confirm, x) -> {
                         getPreferences(0).edit().remove("home-left").remove("home-right").apply();
                         Tasks.toast(this, "首页设置已清除");
                     }).show();
         }).show();
+    }
+    private void densityOptions() {
+        new AlertDialog.Builder(this).setTitle("列表密度")
+                .setSingleChoiceItems(new String[]{"紧凑", "舒适（行高与图标更大）"}, comfortable ? 1 : 0, (d, n) -> {
+                    d.dismiss();
+                    if ((n == 1) == comfortable) return;
+                    getPreferences(0).edit().putBoolean("comfortable", n == 1).apply();
+                    recreate();
+                }).setNegativeButton("取消", null).show();
     }
     @Override public void onDestroy() {
         for (Pane pane : new Pane[]{left, right}) if (pane != null) {
@@ -554,7 +566,7 @@ public class MainActivity extends LabActivity {
             File target = new File(path.getText().toString().trim());
             if (!target.isAbsolute()) { path.setError("请输入绝对路径"); return; }
             FileStore.Node destination = FileStore.directory(target, source.location.root);
-            mutate(() -> { store.list(destination); for (FileStore.Node n : nodes) store.copy(n, destination, move); return true; }, done -> {
+            mutate(() -> { store.copyAll(nodes, destination, move); return true; }, done -> {
                 dialog.dismiss(); source.selected.clear(); left.reload(); right.reload(); actionBar(); Tasks.toast(this, "操作完成");
             });
         })); dialog.show();
@@ -653,16 +665,49 @@ public class MainActivity extends LabActivity {
     private void transfer(List<FileStore.Node> nodes, Pane source, Pane target, boolean move) {
         if (nodes.isEmpty()) { Tasks.toast(this, "先长按选择文件"); return; }
         FileStore.Node destination = target.location;
-        mutate(() -> { for (FileStore.Node n : nodes) store.copy(n, destination, move); return nodes.size(); },
+        mutate(() -> store.copyAll(nodes, destination, move).size(),
                 n -> { source.selected.clear(); source.reload(); target.reload(); actionBar();
                     status.setText((move ? "移动" : "复制") + "完成 · " + n + " 项"); });
     }
+    /** Runs one file operation; after 400 ms a dialog shows item progress and lets the user stop at the next item. */
     private <T> void mutate(Tasks.Job<T> job, Tasks.Done<T> done) {
         if (busy) { Tasks.toast(this, "请等待当前操作完成"); return; }
         busy = true; header();
+        Tasks.Progress progress = new Tasks.Progress();
+        TextView detail = Ui.text(this, "准备中…", 13, Ui.TEXT);
+        detail.setPadding(dp(20), dp(8), dp(20), dp(4));
+        detail.setMaxLines(3); detail.setContentDescription("操作进度");
+        ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        bar.setIndeterminate(true);
+        LinearLayout body = Ui.column(this); body.addView(detail);
+        LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(-1, -2);
+        barParams.setMargins(dp(20), dp(4), dp(20), dp(8)); body.addView(bar, barParams);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("正在处理").setView(body).setCancelable(false)
+                .setNegativeButton("取消", null).create();
+        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+            progress.cancelled.set(true); detail.setText("正在停止，当前项目完成后结束…");
+            v.setEnabled(false);
+        }));
+        boolean[] finished = {false};
+        Runnable[] tick = new Runnable[1];
+        tick[0] = () -> {
+            if (finished[0] || isDestroyed()) return;
+            if (!dialog.isShowing()) dialog.show();
+            if (!progress.cancelled.get()) detail.setText("已处理 " + progress.done.get() + " 项\n" + progress.current);
+            detail.postDelayed(tick[0], 250);
+        };
+        detail.postDelayed(tick[0], 400);
+        Runnable close = () -> { finished[0] = true; detail.removeCallbacks(tick[0]); if (dialog.isShowing()) dialog.dismiss(); };
         Tasks.run(this, () -> {
-            try { return job.run(); } finally { runOnUiThread(() -> { busy = false; directorySnapshots.clear(); header(); }); }
-        }, done);
+            try { return progress.run(job); }
+            finally { runOnUiThread(() -> { busy = false; directorySnapshots.clear(); header(); }); }
+        }, value -> { close.run(); done.accept(value); }, error -> {
+            close.run();
+            if (error instanceof Tasks.CancelledException) {
+                left.reload(); right.reload(); actionBar();
+                Tasks.toast(this, "已取消，未完成的项目已撤回");
+            } else Tasks.showError(this, error);
+        });
     }
     private void compress(List<FileStore.Node> nodes) {
         Pane pane = active; FileStore.Node destination = pane.location;
@@ -816,7 +861,7 @@ public class MainActivity extends LabActivity {
     private void browseArchive(FileStore.Node node) {
         Pane pane = active;
         FileStore.Node directory = FileStore.archiveNode(node, "", true, 0, 0);
-        Tasks.run(this, () -> { store.list(directory); return directory; }, pane::navigate);
+        pane.navigate(directory);
     }
     private void preview(FileStore.Node node, String kind) {
         Intent intent = new Intent(this, PreviewActivity.class); node.put(intent); intent.putExtra("kind", kind); startActivity(intent);
@@ -992,27 +1037,8 @@ public class MainActivity extends LabActivity {
         intent.putExtra("root", active.location.root); startActivity(intent);
     }
     private void searchDialog() {
-        FileStore.Node start = active.location;
-        LinearLayout body = Ui.column(this); EditText query = Ui.input(this, "文件名 / 内容");
-        Spinner scope = new Spinner(this);
-        scope.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"当前目录及子目录", "全部共享存储"}));
-        CheckBox regex = new CheckBox(this); regex.setText("正则表达式");
-        CheckBox content = new CheckBox(this); content.setText("搜索文本内容（每个文件最多 2 MiB）");
-        body.addView(query); body.addView(scope); body.addView(regex); body.addView(content);
-        AlertDialog.Builder search = new AlertDialog.Builder(this).setTitle("递归搜索 · 当前目录").setView(body).setNegativeButton("取消", null);
-        if (SearchJob.active() != null) search.setNeutralButton("已有搜索结果", (d, w) -> startActivity(new Intent(this, SearchActivity.class)));
-        search.setPositiveButton("搜索", (d, w) -> {
-                    String q = query.getText().toString(); if (q.isEmpty()) return;
-                    Pattern pattern;
-                    try { pattern = Pattern.compile(regex.isChecked() ? q : Pattern.quote(q), Pattern.CASE_INSENSITIVE); }
-                    catch (Exception e) { Tasks.toast(this, e.getMessage()); return; }
-                    boolean contents = content.isChecked();
-                    FileStore.Node searchRoot = scope.getSelectedItemPosition() == 1
-                            ? FileStore.directory(Environment.getExternalStorageDirectory(), false) : start;
-                    SearchJob.start(this, searchRoot, q, pattern, contents);
-                    startActivity(new Intent(this, SearchActivity.class));
-                }).show();
+        startActivity(new Intent(this, SearchActivity.class)
+                .putExtra("rootKey", active.location.key()).putExtra("rootPath", active.location.path()));
     }
     static boolean isText(String name) {
         return name.toLowerCase(Locale.ROOT).matches(".*\\.(txt|xml|json|smali|java|kt|gradle|properties|md|js|html|css|yml|yaml|sh|ini|cfg|log|csv)$");
@@ -1034,11 +1060,12 @@ public class MainActivity extends LabActivity {
     @Override protected void onPaletteChanged() {
         for (Pane pane : new Pane[]{left, right}) if (pane != null) {
             pane.adapter.notifyDataSetChanged(); pane.pullEdge.invalidate();
+            pane.spinnerRing.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(Ui.ACCENT));
         }
     }
     @Override protected void handleBack() {
         if (active != null) active.clearMark();
-        if (sheet != null && sheet.isShowing()) { sheet.dismiss(); return; }
+        if (sheet != null && sheet.isShowing()) { sheet.close(); return; }
         if (fileMenu != null && fileMenu.isShowing()) { fileMenu.cancel(); return; }
         if (popupMenu != null && popupMenu.isShowing()) { popupMenu.dismiss(); return; }
         if (drawer != null && drawer.isShowing()) { drawer.dismiss(); return; }
@@ -1056,11 +1083,11 @@ public class MainActivity extends LabActivity {
     private final class Pane extends LinearLayout {
         final boolean isLeft;
         final View indicator;
-        final TextView path, empty, summary;
+        final TextView path, empty, summary, hint;
         final SwipeSelectListView list;
         final FrameLayout refresh;
         final PullEdgeView pullEdge;
-        final View spinnerRing;
+        final ProgressBar spinnerRing;
         final Adapter adapter;
         final List<FileStore.Node> all = new ArrayList<>(), entries = new ArrayList<>();
         final Set<String> selected = new HashSet<>();
@@ -1098,10 +1125,16 @@ public class MainActivity extends LabActivity {
             empty = Ui.text(MainActivity.this, "读取中…", 12, Ui.MUTED); empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(12), dp(12), dp(12), dp(12));
             frame.addView(empty, new FrameLayout.LayoutParams(-1, -1)); list.setEmptyView(empty);
+            hint = Ui.text(MainActivity.this, "", 12, Ui.MUTED); hint.setGravity(Gravity.CENTER);
+            hint.setPadding(dp(12), dp(10), dp(12), dp(10)); hint.setVisibility(GONE);
+            hint.setOnClickListener(v -> { if (!filter.isEmpty()) { filter = ""; apply(); } });
+            FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(-1, -2, Gravity.TOP);
+            hintParams.topMargin = rowHeight() + dp(8); frame.addView(hint, hintParams);
             pullEdge = new PullEdgeView(MainActivity.this);
             frame.addView(pullEdge, new FrameLayout.LayoutParams(-1, dp(132), Gravity.TOP));
-            spinnerRing = new View(MainActivity.this);
-            spinnerRing.setBackground(ring(false));
+            spinnerRing = new ProgressBar(MainActivity.this, null, android.R.attr.progressBarStyleSmall);
+            spinnerRing.setIndeterminate(true);
+            spinnerRing.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(Ui.ACCENT));
             spinnerRing.setVisibility(View.GONE);
             FrameLayout.LayoutParams spinnerParams = new FrameLayout.LayoutParams(dp(26), dp(26));
             spinnerParams.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP; spinnerParams.topMargin = dp(8);
@@ -1283,8 +1316,7 @@ public class MainActivity extends LabActivity {
             if (loading != null) { loading.cancel(false); loading = null; }
             long started = SystemClock.uptimeMillis();
             if (feedback) list.stopForRefresh(); else list.stopForNavigation();
-            if (feedback) { spinnerRing.setAlpha(1f); spinnerRing.setScaleX(.6f); spinnerRing.setScaleY(.6f);
-                spinnerRing.setBackground(ring(true)); spinnerRing.setVisibility(VISIBLE); }
+            if (feedback) spinnerRing.setVisibility(VISIBLE);
             path.setText(current.file != null ? (current.path().equals("/storage/emulated/0") ? "内部存储" : current.name)
                     : current.name);
             path.setContentDescription(current.path()); path.setTooltipText(current.path());
@@ -1307,7 +1339,12 @@ public class MainActivity extends LabActivity {
             loading = Tasks.BROWSE.submit(() -> {
                 if (token != generation || isDestroyed()) return;
                 List<FileStore.Node> found; String error = null; FileStore.Node resolved = current;
-                try { resolved = RootAccess.automatic(current); found = store.list(resolved); }
+                try {
+                    resolved = RootAccess.automatic(current);
+                    if (feedback && resolved.container != null && resolved.container.file != null)
+                        ArchiveOps.forget(resolved.container.file);
+                    found = store.list(resolved);
+                }
                 catch (Exception e) { found = Collections.emptyList(); error = e.getMessage(); }
                 Map<String, String> descriptions = new HashMap<>();
                 SimpleDateFormat formatter = new SimpleDateFormat("yy-MM-dd HH:mm", Locale.CHINA);
@@ -1365,17 +1402,19 @@ public class MainActivity extends LabActivity {
                             directoryPlaces.visit(current); recordedDirectory = current.key();
                         }
                     }
-                    if (direction != 0 && message == null) slideIn(direction);
                     if (active == this) actionBar();
+                    updateHint();
         }
-        void slideIn(int direction) {
-            // Only a list the user can actually see slides in; a background load or a test probe must not blank it.
-            if (direction == 0 || active != this || getWindowVisibility() != VISIBLE || !isShown()) return;
-            list.animate().cancel();
-            list.setAlpha(0f);
-            list.setTranslationX(dp(direction > 0 ? 30 : -30));
-            list.animate().alpha(1f).translationX(0f).setDuration(230)
-                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.7f)).start();
+        void updateHint() {
+            boolean showing = entries.isEmpty() && list.getVisibility() == VISIBLE && empty.getVisibility() != VISIBLE;
+            if (!showing) { hint.setVisibility(GONE); hint.setClickable(false); return; }
+            int hidden = 0;
+            if (!showHidden) for (FileStore.Node n : all) if (n.name.startsWith(".")) hidden++;
+            if (!filter.isEmpty()) hint.setText("没有匹配“" + filter + "”的项目 · 点按清除过滤");
+            else if (hidden > 0) hint.setText("仅含 " + hidden + " 个隐藏项目");
+            else hint.setText("此目录为空");
+            hint.setClickable(!filter.isEmpty());
+            if (hint.getVisibility() != VISIBLE) { hint.setVisibility(VISIBLE); if (hint.isShown()) Ui.fadeIn(hint); }
         }
         void apply() {
             list.finishGesture();
@@ -1403,6 +1442,7 @@ public class MainActivity extends LabActivity {
             for (FileStore.Node n : entries) if (n.directory) folders++;
             folderCount = folders;
             summary.setText(folders + " 目录 · " + (entries.size() - folders) + " 文件" + (!filter.isEmpty() ? " · 过滤" : ""));
+            updateHint();
             if (active == this) { header(); actionBar(); }
         }
         private final class Adapter extends BaseAdapter {
@@ -1416,8 +1456,10 @@ public class MainActivity extends LabActivity {
                 else holder = (Row) reuse.getTag();
                 boolean checked = n != null && selected.contains(n.key());
                 boolean marked = n != null && rowIdentity(n).equals(Pane.this.marked);
-                holder.node = n;
-                holder.background.setColor(checked ? Ui.TINT : Ui.SURFACE);
+                // Only a row that keeps its file and changes selection animates; recycled rows switch at once.
+                boolean toggled = n != null && n == holder.node && checked != holder.checked;
+                holder.node = n; holder.checked = checked;
+                holder.showSelection(checked, toggled);
                 holder.name.setTextColor(marked ? Ui.HIT : Ui.TEXT);
                 boolean apk = n != null && ApkInstall.isApkName(n.name);
                 boolean archive = n != null && isArchive(n.name.toLowerCase(Locale.ROOT));
@@ -1445,6 +1487,28 @@ public class MainActivity extends LabActivity {
                 final android.graphics.drawable.GradientDrawable iconBackground = Ui.background(Ui.ICON_BG, dp(5));
                 FileStore.Node node;
                 int drawable, badgeGeneration;
+                boolean checked;
+                android.animation.ValueAnimator tint;
+                void showSelection(boolean on, boolean animate) {
+                    if (tint != null) { tint.cancel(); tint = null; }
+                    int to = on ? Ui.TINT : Ui.SURFACE;
+                    android.content.res.ColorStateList current = background.getColor();
+                    int from = current == null ? to : current.getDefaultColor();
+                    if (!animate || from == to || !row.isShown()) {
+                        background.setColor(to); icon.animate().cancel(); icon.setScaleX(1f); icon.setScaleY(1f); return;
+                    }
+                    tint = android.animation.ValueAnimator.ofArgb(from, to).setDuration(Ui.MOTION_SHORT);
+                    tint.addUpdateListener(a -> background.setColor((int) a.getAnimatedValue()));
+                    tint.addListener(new android.animation.AnimatorListenerAdapter() {
+                        @Override public void onAnimationCancel(android.animation.Animator a) { background.setColor(to); }
+                    });
+                    tint.start();
+                    if (on) {
+                        icon.animate().cancel(); icon.setScaleX(.78f); icon.setScaleY(.78f);
+                        icon.animate().scaleX(1f).scaleY(1f).setDuration(220)
+                                .setInterpolator(new android.view.animation.OvershootInterpolator(2.2f)).start();
+                    }
+                }
                 void bindAppBadge(FileStore.Node entry, boolean checked) {
                     int token = ++badgeGeneration;
                     appBadge.setImageDrawable(null); appBadge.setVisibility(View.GONE);
@@ -1456,20 +1520,27 @@ public class MainActivity extends LabActivity {
                     });
                 }
                 Row() {
+                    int iconSize = comfortable ? 36 : 28, frameWidth = iconSize + 4, badgeSize = comfortable ? 22 : 18;
+                    name.setTextSize(comfortable ? 15 : 13); meta.setTextSize(comfortable ? 11 : 10);
                     row.setPadding(dp(5), dp(2), dp(5), dp(2));
-                    row.setLayoutParams(new AbsListView.LayoutParams(-1, dp(41))); row.setTag(this);
+                    row.setLayoutParams(new AbsListView.LayoutParams(-1, rowHeight())); row.setTag(this);
                     row.setBackground(new android.graphics.drawable.RippleDrawable(
                             android.content.res.ColorStateList.valueOf(0x227f9991), background, null));
-                    icon.setPadding(dp(5), dp(5), dp(5), dp(5)); icon.setBackground(iconBackground);
-                    iconFrame.addView(icon, new FrameLayout.LayoutParams(dp(28), dp(28), Gravity.TOP | Gravity.START));
+                    int inset = comfortable ? 7 : 5;
+                    icon.setPadding(dp(inset), dp(inset), dp(inset), dp(inset)); icon.setBackground(iconBackground);
+                    iconFrame.addView(icon, new FrameLayout.LayoutParams(dp(iconSize), dp(iconSize), Gravity.CENTER_VERTICAL | Gravity.START));
                     appBadge.setScaleType(ImageView.ScaleType.FIT_CENTER);
                     appBadge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
                     appBadge.setVisibility(View.GONE);
-                    iconFrame.addView(appBadge, new FrameLayout.LayoutParams(dp(18), dp(18), Gravity.BOTTOM | Gravity.END));
-                    row.addView(iconFrame, lp(36, 36));
+                    // The frame spans the row height for a larger tap target; the badge stays on the icon's corner.
+                    FrameLayout.LayoutParams badge = new FrameLayout.LayoutParams(dp(badgeSize), dp(badgeSize), Gravity.CENTER_VERTICAL | Gravity.END);
+                    badge.topMargin = dp(iconSize - badgeSize + 8); iconFrame.addView(appBadge, badge);
+                    row.addView(iconFrame, new LinearLayout.LayoutParams(dp(frameWidth), -1));
                     LinearLayout text = Ui.column(MainActivity.this); name.setEllipsize(TextUtils.TruncateAt.END);
-                    text.addView(name, lp(-1, 21)); text.addView(meta, lp(-1, 15));
-                    LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1); p.leftMargin = dp(5);
+                    text.addView(name, new LinearLayout.LayoutParams(-1, scaled(comfortable ? 24 : 21)));
+                    text.addView(meta, new LinearLayout.LayoutParams(-1, scaled(comfortable ? 17 : 15)));
+                    LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1);
+                    p.leftMargin = dp(comfortable ? 8 : 4); p.gravity = Gravity.CENTER_VERTICAL;
                     row.addView(text, p);
                     View.OnClickListener select = v -> {
                         if (!list.isEnabled()) return;

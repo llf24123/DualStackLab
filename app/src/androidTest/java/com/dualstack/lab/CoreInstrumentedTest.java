@@ -440,9 +440,17 @@ public class CoreInstrumentedTest {
         ApkTools.disassemble(dex, smali);
         assertTrue(new File(smali, "fixture/Sample.smali").isFile());
         File rebuilt = new File(work, "rebuilt.dex"); ApkTools.assemble(smali, rebuilt);
-        ApkTools.saveDexClass(rebuilt, "", CLASS, SMALI.replace("0x1", "0x2"), work);
-        assertEquals(2, literal(rebuilt));
+        for (int mode : new int[]{0640, 0755}) {
+            android.system.Os.chmod(rebuilt.getPath(), mode);
+            ApkTools.saveDexClass(rebuilt, "", CLASS, SMALI.replace("0x1", "0x2"), work);
+            assertEquals(2, literal(rebuilt));
+            assertEquals(mode, android.system.Os.stat(rebuilt.getPath()).st_mode & 07777);
+        }
         String hash = ApkTools.sha256(rebuilt);
+        File link = new File(work, "linked.dex"); android.system.Os.symlink(rebuilt.getPath(), link.getPath());
+        try { ApkTools.saveDexClass(link, "", CLASS, SMALI, work); fail("linked DEX edited"); }
+        catch (IOException expected) { }
+        assertTrue(Files.isSymbolicLink(link.toPath())); assertEquals(hash, ApkTools.sha256(rebuilt));
         try { ApkTools.saveDexClass(rebuilt, "", CLASS, "broken smali", work); fail("invalid smali"); }
         catch (IOException expected) {}
         assertEquals(hash, ApkTools.sha256(rebuilt));
@@ -450,9 +458,16 @@ public class CoreInstrumentedTest {
 
     @Test public void binaryXmlAndArscWriteBack() throws Exception {
         File apk = fixtureApk();
+        android.system.Os.chmod(apk.getPath(), 0640);
         String xml = ApkTools.xmlText(apk, "AndroidManifest.xml");
         assertTrue(xml.contains("com.dualstack.lab"));
         ApkTools.saveXml(apk, "AndroidManifest.xml", manifest("com.dualstack.fixture"));
+        assertEquals(0640, android.system.Os.stat(apk.getPath()).st_mode & 07777);
+        File link = new File(work, "linked.apk"); android.system.Os.symlink(apk.getPath(), link.getPath());
+        String unchanged = ApkTools.sha256(apk);
+        try { ApkTools.saveXml(link, "AndroidManifest.xml", xml); fail("linked APK edited"); }
+        catch (IOException expected) { }
+        assertTrue(Files.isSymbolicLink(link.toPath())); assertEquals(unchanged, ApkTools.sha256(apk));
         assertTrue(ApkTools.xmlText(apk, "AndroidManifest.xml").contains("com.dualstack.fixture"));
         String json = ApkTools.arscText(apk, "resources.arsc");
         ApkTools.saveArsc(apk, "resources.arsc", json);

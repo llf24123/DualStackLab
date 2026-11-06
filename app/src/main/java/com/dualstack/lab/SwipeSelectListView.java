@@ -111,7 +111,9 @@ final class SwipeSelectListView extends ListView {
         } else if (event.getActionMasked() == MotionEvent.ACTION_MOVE && !selecting) {
             // Screen coordinates stay stable while the list itself is translated under the finger.
             float dx = Math.abs(event.getRawX() - downX), dy = event.getRawY() - downY;
-            if (!vertical && Math.abs(dy) > slop && Math.abs(dy) >= dx) vertical = true;
+            if (dx > slop && dx > Math.abs(dy)) cancelPendingInputEvents();
+            // Any early vertical travel marks the stroke as a scroll, even if it later drifts sideways.
+            if (!vertical && Math.abs(dy) > slop && Math.abs(dy) * 1.2f >= dx) vertical = true;
             if (pulling || vertical && dy > slop && atTop()) {
                 if (!pulling) {
                     pulling = true;
@@ -121,8 +123,10 @@ final class SwipeSelectListView extends ListView {
                 }
                 offset(damped(dy));
             } else if (!vertical && start >= 0 && selection != null
-                    && dx > Math.max(slop * 2, Ui.dp(getContext(), 24)) && dx > Math.abs(dy) * 1.4f) {
+                    && dx > Math.max(slop * 3, Ui.dp(getContext(), 40)) && dx > Math.abs(dy) * 2.2f) {
+                // A deliberate, mostly horizontal stroke starts selection; a slanted scroll does not.
                 selecting = true; checked = !selection.selected(start);
+                performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
                 MotionEvent cancel = MotionEvent.obtain(event); cancel.setAction(MotionEvent.ACTION_CANCEL);
                 super.onTouchEvent(cancel); cancel.recycle();
                 getParent().requestDisallowInterceptTouchEvent(true);
@@ -155,8 +159,15 @@ final class SwipeSelectListView extends ListView {
                     || event.getActionMasked() == MotionEvent.ACTION_POINTER_DOWN) finishGesture();
             return true;
         }
-        if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL)
+        if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+            boolean sideways = event.getActionMasked() == MotionEvent.ACTION_UP && !vertical
+                    && Math.abs(event.getRawX() - downX) > slop && Math.abs(event.getRawY() - downY) <= slop;
             finishGesture();
+            if (sideways) {
+                MotionEvent cancel = MotionEvent.obtain(event); cancel.setAction(MotionEvent.ACTION_CANCEL);
+                super.onTouchEvent(cancel); cancel.recycle(); return true;
+            }
+        }
         return super.onTouchEvent(event);
     }
 

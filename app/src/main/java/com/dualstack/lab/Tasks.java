@@ -36,5 +36,26 @@ final class Tasks {
                 .setPositiveButton("确定", null).show();
     }
     static void toast(Activity a, String text) { Toast.makeText(a, text, Toast.LENGTH_SHORT).show(); }
+    /** Raised at an item boundary after the user stops a long operation. */
+    static final class CancelledException extends java.io.IOException {
+        CancelledException() { super("已取消"); }
+    }
+    /** Item-level progress for one worker thread; file loops call {@link #step} once per entry they handle. */
+    static final class Progress {
+        private static final ThreadLocal<Progress> CURRENT = new ThreadLocal<>();
+        final java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        final java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+        volatile String current = "";
+        static void step(String name) throws CancelledException {
+            Progress progress = CURRENT.get();
+            if (progress == null) return;
+            if (progress.cancelled.get()) throw new CancelledException();
+            progress.current = name == null ? "" : name; progress.done.incrementAndGet();
+        }
+        <T> T run(Job<T> job) throws Exception {
+            CURRENT.set(this);
+            try { return job.run(); } finally { CURRENT.remove(); }
+        }
+    }
     private Tasks() {}
 }

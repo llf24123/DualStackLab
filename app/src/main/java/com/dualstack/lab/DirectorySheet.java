@@ -24,20 +24,27 @@ final class DirectorySheet {
     private final View recentLine, bookmarkLine;
     private final BaseAdapter adapter;
     private boolean showingBookmarks;
+    /** TRUE while sliding open, FALSE while sliding closed, null when settled or following a finger. */
+    private Boolean settling;
 
     DirectorySheet(Activity activity, DirectoryPlaces places, FileStore.Node current,
                    Consumer<DirectoryPlaces.Entry> navigate) {
         this.activity = activity; this.places = places; this.current = current; this.navigate = navigate;
-        overlay = new FrameLayout(activity);
+        overlay = new FrameLayout(activity) {
+            @Override public boolean dispatchTouchEvent(MotionEvent event) {
+                // While closing, touches reach the panes underneath instead of being swallowed by the fading scrim.
+                return !Boolean.FALSE.equals(settling) && super.dispatchTouchEvent(event);
+            }
+        };
         overlay.setContentDescription("最近与书签面板");
         overlay.setOnApplyWindowInsetsListener((view, insets) -> { resize(); return insets; });
         overlay.addOnLayoutChangeListener((view, l, t, r, b, oldL, oldT, oldR, oldB) -> resize());
         scrim = new View(activity); scrim.setBackgroundColor(0x66000000);
-        scrim.setOnClickListener(v -> dismiss());
+        scrim.setOnClickListener(v -> close());
         overlay.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
         showingBookmarks = true;
-        body = new SwipeLayout(activity, false, this::dismiss);
-        body.setDragCallbacks(() -> body.animate().cancel(),
+        body = new SwipeLayout(activity, false, this::close);
+        body.setDragCallbacks(() -> { settling = null; body.animate().cancel(); scrim.animate().cancel(); },
                 this::position, commit -> settle(!commit));
         body.setOrientation(LinearLayout.VERTICAL); body.setBackgroundColor(Ui.SURFACE);
         LinearLayout tabs = Ui.row(activity);
@@ -68,17 +75,17 @@ final class DirectorySheet {
         body.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1));
         body.addView(Ui.line(activity));
         LinearLayout footer = Ui.row(activity); footer.setGravity(Gravity.CENTER);
-        footer.addView(Ui.icon(activity, R.drawable.ic_chevron_down, "收起最近与书签", Ui.MUTED, this::dismiss), lp(64, 52));
+        footer.addView(Ui.icon(activity, R.drawable.ic_chevron_down, "收起最近与书签", Ui.MUTED, this::close), lp(64, 52));
         body.addView(footer, lp(-1, 52));
         body.setClipToPadding(false); body.setClipChildren(false);
         body.persistentInsets = true;
         body.setPadding(0, 0, 0, safeBottom());
         body.canSwipe = () -> !list.canScrollVertically(-1);
-        list.setOnItemClickListener((p, v, position, id) -> { dismiss(); navigate.accept(visible.get(position)); });
+        list.setOnItemClickListener((p, v, position, id) -> { DirectoryPlaces.Entry entry = visible.get(position); close(); navigate.accept(entry); });
         list.setOnItemLongClickListener((p, v, position, id) -> { entryMenu(visible.get(position)); return true; });
         update();
     }
-    void show() { show(false); settle(true); }
+    void show() { show(true); settle(true); }
     void showForDrag() { show(true); }
     private void show(boolean startHidden) {
         if (isShowing()) return;
@@ -121,6 +128,7 @@ final class DirectorySheet {
         list.setClipToPadding(false);
         body.requestLayout();
         position(dialogHeight * fraction);
+        if (settling != null) settle(settling);
     }
     private Rect safeInsets() {
         WindowInsets insets = host.getRootWindowInsets();
@@ -157,14 +165,19 @@ final class DirectorySheet {
     }
     void drag(float distance) { position(dialogHeight - distance); }
     void finishDrag(boolean commit) { settle(commit); }
+    /** Every close path slides the panel out first; dismiss() stays immediate for teardown. */
+    void close() { if (isShowing() && !Boolean.FALSE.equals(settling)) settle(false); }
     private void settle(boolean open) {
         body.animate().cancel(); scrim.animate().cancel();
-        body.animate().translationY(open ? 0 : dialogHeight).setDuration(150)
-                .setInterpolator(new android.view.animation.DecelerateInterpolator())
-                .withEndAction(open ? null : this::dismiss).start();
-        scrim.animate().alpha(open ? 1 : 0).setDuration(150).start();
+        settling = open;
+        body.animate().translationY(open ? 0 : dialogHeight).setDuration(open ? 180 : 150)
+                .setInterpolator(open ? new android.view.animation.DecelerateInterpolator()
+                        : new android.view.animation.AccelerateInterpolator())
+                .withEndAction(() -> { settling = null; if (!open) dismiss(); }).start();
+        scrim.animate().alpha(open ? 1 : 0).setDuration(open ? 180 : 150).start();
     }
     void dismiss() {
+        settling = null;
         body.animate().cancel(); scrim.animate().cancel();
         if (overlay.getParent() instanceof ViewGroup parent) parent.removeView(overlay);
         overlay.removeView(body); host = null;
@@ -262,7 +275,9 @@ final class DirectorySheet {
             return persistentInsets ? insets : super.onApplyWindowInsets(insets);
         }
         private void begin(MotionEvent event) {
-            animate().cancel(); x = event.getRawX(); y = event.getRawY(); swiping = false;
+            // A tap must not freeze an opening animation; a real drag cancels it through dragStart.
+            if (dragStart == null) animate().cancel();
+            x = event.getRawX(); y = event.getRawY(); swiping = false;
         }
         private boolean track(MotionEvent event) {
             float dy = event.getRawY() - y;

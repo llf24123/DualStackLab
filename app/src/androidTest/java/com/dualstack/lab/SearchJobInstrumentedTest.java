@@ -50,6 +50,36 @@ public class SearchJobInstrumentedTest {
         assertNull(state.error());
     }
 
+    @Test public void contentSnippetIsBoundedAndHighlightsTheMatchingLine() {
+        SearchJob.Hit hit = SearchJob.contentHit(Pattern.compile("needle"), "first\n" + "x".repeat(80) + "needle\tend\nlast");
+        assertNotNull(hit); assertEquals(2, hit.line());
+        assertTrue(hit.text().startsWith("…")); assertFalse(hit.text().contains("\t"));
+        assertEquals("needle", hit.text().substring(hit.start(), hit.end()));
+        SearchJob.Hit longHit = SearchJob.contentHit(Pattern.compile("x+"), "x".repeat(10000));
+        assertTrue(longHit.text().length() <= 162); assertTrue(longHit.end() <= longHit.text().length());
+    }
+    @Test public void snippetsHandleZeroLengthAndMultilineMatches() {
+        for (String pattern : new String[]{"^", "$", "\\n", "first\\nsecond", "(?m)^second"}) {
+            SearchJob.Hit hit = SearchJob.contentHit(Pattern.compile(pattern), "first\nsecond");
+            assertNotNull(pattern, hit); assertTrue(hit.start() >= 0);
+            assertTrue(pattern, hit.end() >= hit.start()); assertTrue(hit.end() <= hit.text().length());
+        }
+        assertEquals(2, SearchJob.contentHit(Pattern.compile("second"), "first\nsecond").line());
+        assertNull(SearchJob.contentHit(Pattern.compile("missing"), "first"));
+    }
+    @Test public void hiddenDirectoriesAreSkippedAndContentMatchesCarryLineNumbers() throws Exception {
+        File hidden = new File(work, ".secret"); assertTrue(hidden.mkdir());
+        Files.write(new File(hidden, "inside.txt").toPath(), "needle".getBytes(StandardCharsets.UTF_8));
+        File visible = new File(work, "visible.txt"); Files.write(visible.toPath(), "first\nneedle\n".getBytes(StandardCharsets.UTF_8));
+        SearchJob job = SearchJob.start(context, FileStore.directory(work, false), "needle", Pattern.compile("needle"), true, false);
+        long deadline = System.currentTimeMillis() + 10000;
+        while (!job.snapshot().finished() && System.currentTimeMillis() < deadline) Thread.sleep(20);
+        assertTrue(job.snapshot().finished()); assertNull(job.snapshot().error());
+        assertEquals(1, job.snapshot().matches().size());
+        assertEquals("visible.txt", job.snapshot().matches().get(0).name);
+        assertEquals(2, job.hit(job.snapshot().matches().get(0)).line());
+    }
+
     @Test public void cancelStopsTheSearchAndIsObservable() throws Exception {
         for (int i = 0; i < 120; i++) {
             File folder = new File(work, "folder-" + i); assertTrue(folder.mkdir());

@@ -8,7 +8,14 @@ import java.util.zip.*;
 
 final class ArchiveOps {
     record Item(String path, String name, boolean directory, long size, long modified) {}
-    private record Index(long size, long modified, Map<String, List<Item>> folders) {}
+    private record Stamp(long size, long modified, long device, long inode) {}
+    private record Index(Stamp stamp, Map<String, List<Item>> folders) {}
+    private static Stamp stamp(File file) throws IOException {
+        try {
+            android.system.StructStat stat = android.system.Os.stat(file.getPath());
+            return new Stamp(stat.st_size, file.lastModified(), stat.st_dev, stat.st_ino);
+        } catch (android.system.ErrnoException error) { throw new IOException(error); }
+    }
     private static final Map<String, Index> indexes = new LinkedHashMap<>(8, .75f, true);
     private static final Map<String, char[]> passwords = new HashMap<>();
     static final class PasswordRequired extends IOException {
@@ -45,12 +52,18 @@ final class ArchiveOps {
         if (password != null && password.length > 0) setPassword(archive, password);
     }
     static synchronized List<Item> list(File file, String prefix) throws IOException {
-        if (isRar(file)) return RarArchiveOps.list(file, prefix);
-        if (ArchiveFormats.supported(file)) return ArchiveFormats.list(file, prefix);
+        if (isRar(file)) return cachedFolder(file, prefix, () -> RarArchiveOps.list(file, prefix));
+        if (ArchiveFormats.supported(file)) return cachedFolder(file, prefix, () -> ArchiveFormats.list(file, prefix));
         String key = file.getCanonicalPath();
+        Stamp current = stamp(file);
         Index cached = indexes.get(key);
-        if (cached != null && cached.size == file.length() && cached.modified == file.lastModified())
+        if (cached != null && cached.stamp.equals(current))
             return new ArrayList<>(cached.folders.getOrDefault(prefix, Collections.emptyList()));
+        if (cached != null) { indexes.remove(key); indexItems.remove(key); }
+        Fallback fallback = fallbacks.get(key);
+        if (fallback != null && fallback.stamp.equals(current))
+            return cachedFolder(file, prefix, () -> fallback.encrypted ? listZip4j(file, prefix) : listPrefix(file, prefix));
+        fallbacks.remove(key);
         Map<String, Map<String, Item>> folders = new HashMap<>();
         int indexed = 0;
         try (ZipFile zip = new ZipFile(file)) {
@@ -68,13 +81,19 @@ final class ArchiveOps {
                     Map<String, Item> children = folders.computeIfAbsent(parent, p -> new LinkedHashMap<>());
                     if (!children.containsKey(child)) {
                         children.put(child, new Item(child, name, folder, folder ? 0 : entry.getSize(), entry.getTime()));
-                        if (++indexed > 12000) return listPrefix(file, prefix);
+                        if (++indexed > INDEX_LIMIT) {
+                            rememberFallback(key, current, false);
+                            return cachedFolder(file, prefix, () -> listPrefix(file, prefix));
+                        }
                     }
                     parent = child;
                 }
             }
         } catch (ZipException error) {
-            if (encrypted(error.getMessage())) return listZip4j(file, prefix);
+            if (encrypted(error.getMessage())) {
+                rememberFallback(key, current, true);
+                return cachedFolder(file, prefix, () -> listZip4j(file, prefix));
+            }
             throw error;
         }
         Map<String, List<Item>> lists = new HashMap<>();
@@ -83,12 +102,69 @@ final class ArchiveOps {
             children.sort((a, b) -> a.directory != b.directory ? (a.directory ? -1 : 1) : a.name.compareToIgnoreCase(b.name));
             lists.put(parent, children);
         });
-        // Keep only small indexes; large archives remain bounded to one traversal per load.
-        if (lists.values().stream().mapToInt(List::size).sum() < 12000) {
-            if (indexes.size() >= 8) indexes.remove(indexes.keySet().iterator().next());
-            indexes.put(key, new Index(file.length(), file.lastModified(), lists));
+        int total = lists.values().stream().mapToInt(List::size).sum();
+        if (total <= INDEX_LIMIT) {
+            indexes.put(key, new Index(current, lists));
+            indexItems.put(key, total);
+            trimIndexes();
         }
         return new ArrayList<>(lists.getOrDefault(prefix, Collections.emptyList()));
+    }
+    /** Whole-archive ZIP indexes up to this many entries; one APK of this size costs a few MiB of heap. */
+    private static final int INDEX_LIMIT = 60000, INDEX_BUDGET = 120000, FOLDER_BUDGET = 30000;
+    private static final int CACHE_LIMIT = 8, PREFIX_LIMIT = 32;
+    private static final Map<String, Integer> indexItems = new HashMap<>();
+    private record Folders(Stamp stamp, Map<String, List<Item>> lists) {}
+    private record Fallback(Stamp stamp, boolean encrypted) {}
+    private static final Map<String, Fallback> fallbacks = new LinkedHashMap<>(8, .75f, true);
+    private static final Map<String, Folders> folderCache = new LinkedHashMap<>(8, .75f, true);
+    private interface Lister { List<Item> list() throws IOException; }
+    private static void rememberFallback(String key, Stamp stamp, boolean encrypted) {
+        fallbacks.put(key, new Fallback(stamp, encrypted));
+        while (fallbacks.size() > CACHE_LIMIT) fallbacks.remove(fallbacks.keySet().iterator().next());
+    }
+    private static List<Item> cachedFolder(File file, String prefix, Lister lister) throws IOException {
+        String key = file.getCanonicalPath();
+        Stamp current = stamp(file);
+        Folders folders = folderCache.get(key);
+        if (folders == null || !folders.stamp.equals(current)) {
+            folders = new Folders(current, new LinkedHashMap<>(8, .75f, true));
+            folderCache.put(key, folders);
+        }
+        List<Item> known = folders.lists.get(prefix);
+        if (known == null) {
+            known = lister.list();
+            if (known.size() <= FOLDER_BUDGET) {
+                folders.lists.put(prefix, known);
+                while (folders.lists.size() > PREFIX_LIMIT) folders.lists.remove(folders.lists.keySet().iterator().next());
+            }
+            trimFolders();
+        }
+        return new ArrayList<>(known);
+    }
+    private static void trimIndexes() {
+        int total = 0; for (int count : indexItems.values()) total += count;
+        Iterator<String> oldest = indexes.keySet().iterator();
+        while ((total > INDEX_BUDGET || indexes.size() > CACHE_LIMIT) && oldest.hasNext()) {
+            String key = oldest.next(); Integer removed = indexItems.remove(key);
+            total -= removed == null ? 0 : removed; oldest.remove();
+        }
+    }
+    private static void trimFolders() {
+        int total = 0;
+        for (Folders folders : folderCache.values()) for (List<Item> items : folders.lists.values()) total += items.size();
+        Iterator<Folders> oldest = folderCache.values().iterator();
+        while ((total > FOLDER_BUDGET || folderCache.size() > CACHE_LIMIT) && oldest.hasNext()) {
+            for (List<Item> items : oldest.next().lists.values()) total -= items.size();
+            oldest.remove();
+        }
+    }
+    /** Drops cached listings after an archive is rewritten in place. */
+    static synchronized void forget(File archive) {
+        try {
+            String key = archive.getCanonicalPath();
+            indexes.remove(key); indexItems.remove(key); folderCache.remove(key); fallbacks.remove(key);
+        } catch (IOException ignored) { }
     }
     private static List<Item> listZip4j(File file, String prefix) throws IOException {
         Map<String, Map<String, Item>> folders = new HashMap<>();
@@ -271,6 +347,7 @@ final class ArchiveOps {
             while (entries.hasMoreElements()) {
                 ZipEntry e = entries.nextElement(); String path = e.getName();
                 if (!prefix.isEmpty() && !path.equals(prefix) && !(prefix.endsWith("/") && path.startsWith(prefix))) continue;
+                Tasks.Progress.step(path);
                 String relative = prefix.endsWith("/") ? path.substring(prefix.length()) : path;
                 if (selected && !prefix.isEmpty()) relative = prefix.endsWith("/") ? selectedName + "/" + relative : selectedName;
                 if (relative.isEmpty()) continue;
@@ -350,6 +427,7 @@ final class ArchiveOps {
     }
     private static void rewrite(File archive, String remove, String rename, Map<String, File> additions,
                                 Set<String> removals) throws IOException {
+        FileStore.FileState before = FileStore.FileState.read(archive);
         if (isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive))
             throw new IOException("此归档格式暂不支持直接修改，请先解压后编辑");
         for (String name : additions.keySet()) validateEntry(name);
@@ -387,8 +465,8 @@ final class ArchiveOps {
                     out.closeEntry();
                 }
             }
-            FileStore.replace(tmp, archive);
-            indexes.remove(archive.getCanonicalPath());
+            FileStore.publish(tmp, archive, before);
+            forget(archive);
         } finally { Files.deleteIfExists(tmp.toPath()); }
     }
     private static boolean removedParent(String name, Set<String> removals) {
@@ -440,6 +518,7 @@ final class ArchiveOps {
             net.lingala.zip4j.io.outputstream.ZipOutputStream out, Set<String> seen) throws IOException {
         String key = node.file != null ? node.file.getCanonicalPath() : node.key();
         if (!seen.add(key)) throw new IOException("目录包含循环引用");
+        Tasks.Progress.step(path);
         validateEntry(path);
         net.lingala.zip4j.model.ZipParameters parameters = new net.lingala.zip4j.model.ZipParameters();
         parameters.setFileNameInZip(path + (node.directory ? "/" : ""));
@@ -458,6 +537,7 @@ final class ArchiveOps {
                                  Set<String> seen) throws IOException {
         String canonical = node.file != null ? node.file.getCanonicalPath() : node.key();
         if (!seen.add(canonical)) throw new IOException("目录包含循环引用");
+        Tasks.Progress.step(path);
         validateEntry(path);
         ZipEntry entry = new ZipEntry(path + (node.directory ? "/" : ""));
         if (node.modified > 0) entry.setTime(node.modified);

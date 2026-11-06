@@ -19,15 +19,15 @@ import android.widget.TextView;
 final class Ui {
     static int INK = Color.rgb(48, 48, 48);
     static int TEXT = Color.rgb(36, 42, 43);
-    static int MUTED = Color.rgb(119, 127, 130);
+    static int MUTED = Color.rgb(100, 107, 110);
     static int ACCENT = Color.rgb(22, 125, 104);
     static int LINE = Color.rgb(232, 236, 237);
     static int TINT = Color.rgb(236, 247, 243);
     static int SURFACE = Color.WHITE, PANEL = 0xfff6f8f7, WARNING = 0xfff5f3e9, ICON_BG = 0xff303030;
     static boolean dark;
     static final int GOLD = Color.rgb(193, 143, 42);
-    /** Search-hit row tint: a light green that stays distinct from selection and from the dark theme surface. */
-    static int HIT = 0xffdcf3e4;
+    /** Search-hit file-name colour; meets 4.5:1 on the surface, panel and selection tint of its theme. */
+    static int HIT = 0xff2f7a3f;
 
     static String themeMode(Context context) { return context.getSharedPreferences("appearance", 0).getString("mode", "system"); }
     static boolean isDark(Context context) {
@@ -40,7 +40,7 @@ final class Ui {
         dark = isDark(context);
         INK = dark ? 0xff202020 : 0xff303030;
         TEXT = dark ? 0xffe6e8e7 : 0xff242a2b;
-        MUTED = dark ? 0xffa4aaa7 : 0xff777f82;
+        MUTED = dark ? 0xffadb3b0 : 0xff646b6e;
         ACCENT = dark ? 0xff72cdb7 : 0xff167d68;
         LINE = dark ? 0xff353936 : 0xffe8eced;
         TINT = dark ? 0xff24483e : 0xffecf7f3;
@@ -48,7 +48,7 @@ final class Ui {
         PANEL = dark ? 0xff222624 : 0xfff6f8f7;
         WARNING = dark ? 0xff3b3520 : 0xfff5f3e9;
         ICON_BG = dark ? 0xff000000 : 0xff303030;
-        HIT = dark ? 0xffa6e4b4 : 0xff69a977;
+        HIT = dark ? 0xffa6e4b4 : 0xff2f7a3f;
     }
     static void chooseTheme(Activity activity) {
         String mode = themeMode(activity);
@@ -195,6 +195,27 @@ final class Ui {
         v.setBackgroundColor(LINE);
         v.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(c, 1)));
         return v;
+    }
+
+    static final int MOTION_SHORT = 160;
+
+    /** Cross-fades a solid background; a colour already showing, or a view not on screen, switches at once. */
+    static void fadeBackground(View view, int to) {
+        Object running = view.getTag(R.id.motion_color);
+        if (running instanceof android.animation.ValueAnimator animator) animator.cancel();
+        int from = view.getBackground() instanceof android.graphics.drawable.ColorDrawable color ? color.getColor() : to;
+        if (from == to || !view.isShown()) { view.setBackgroundColor(to); return; }
+        android.animation.ValueAnimator animator = android.animation.ValueAnimator.ofArgb(from, to).setDuration(MOTION_SHORT);
+        animator.addUpdateListener(a -> view.setBackgroundColor((int) a.getAnimatedValue()));
+        animator.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(android.animation.Animator a) { view.setTag(R.id.motion_color, null); }
+        });
+        view.setTag(R.id.motion_color, animator); animator.start();
+    }
+    /** Fades a view in from a dimmed but still visible state, so it never disappears from accessibility. */
+    static void fadeIn(View view) {
+        view.animate().cancel(); view.setAlpha(.4f);
+        view.animate().alpha(1f).setDuration(MOTION_SHORT).start();
     }
 
     static void install(Activity a, LinearLayout root) {

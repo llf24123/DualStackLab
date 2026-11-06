@@ -18,6 +18,7 @@ public class PreviewActivity extends LabActivity {
     private TextView status;
     private LinearLayout body;
     private Bitmap bitmap;
+    private boolean destroyed;
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved); store = new FileStore(this);
         body = Ui.column(this); body.addView(Ui.toolbar(this, getIntent().getStringExtra("name") == null ? "预览" : getIntent().getStringExtra("name"), this::finish));
@@ -26,9 +27,14 @@ public class PreviewActivity extends LabActivity {
         String kind = getIntent().getStringExtra("kind");
         Tasks.run(this, () -> {
             FileStore.Node node = store.fromIntent(getIntent());
-            File content = store.materialize(node); return new Source(node, content);
+            File content = store.materialize(node);
+            synchronized (this) {
+                if (destroyed) { release(node, content); return null; }
+                source = node; file = content;
+            }
+            return new Source(node, content);
         }, result -> {
-            source = result.node; file = result.file;
+            if (result == null) return;
             if ("image".equals(kind)) image();
             else if ("html".equals(kind) || "svg".equals(kind)) document(kind);
             else media("audio".equals(kind));
@@ -42,13 +48,16 @@ public class PreviewActivity extends LabActivity {
             if (options.outWidth <= 0) throw new IOException("文件不是可识别图片");
             String dimensions = options.outWidth + " × " + options.outHeight;
             options.inJustDecodeBounds = false; options.inSampleSize = 1;
-            while (Math.max(options.outWidth, options.outHeight) / options.inSampleSize > 2048) options.inSampleSize *= 2;
+            // Zooming needs more detail than the screen; cap the decoded size by edge and by memory.
+            while (Math.max(options.outWidth, options.outHeight) / options.inSampleSize > 4096
+                    || (long) (options.outWidth / options.inSampleSize) * (options.outHeight / options.inSampleSize) * 4 > 48L << 20)
+                options.inSampleSize *= 2;
             Bitmap image = BitmapFactory.decodeFile(file.getAbsolutePath(), options);
             if (image == null) throw new IOException("图片解码失败");
             return new Picture(image, dimensions);
         }, picture -> {
             bitmap = picture.bitmap; status.setText(picture.dimensions + " · " + FileStore.size(file.length()));
-            ImageView image = new ImageView(this); image.setImageBitmap(bitmap); image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            ZoomImageView image = new ZoomImageView(this); image.setImageBitmap(bitmap);
             image.setContentDescription("图片预览"); body.addView(image, new LinearLayout.LayoutParams(-1, 0, 1));
         }, error -> status.setText("无法预览：" + error.getMessage()));
     }
@@ -88,7 +97,12 @@ public class PreviewActivity extends LabActivity {
         if (player != null) player.stopPlayback();
         if (web != null) web.destroy();
         if (bitmap != null) bitmap.recycle();
-        if (file != null && source != null) Tasks.IO.execute(() -> { try { store.release(source, file); } catch (IOException ignored) { } });
+        FileStore.Node owned; File staged;
+        synchronized (this) { destroyed = true; owned = source; staged = file; }
+        if (owned != null && staged != null) Tasks.IO.execute(() -> release(owned, staged));
         super.onDestroy();
+    }
+    private void release(FileStore.Node node, File content) {
+        try { store.release(node, content); } catch (IOException ignored) { }
     }
 }

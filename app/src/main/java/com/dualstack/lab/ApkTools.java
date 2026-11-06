@@ -79,8 +79,9 @@ final class ApkTools {
         }
     }
     private static void writeChanged(ApkModule module, File source) throws IOException {
+        FileStore.FileState before = FileStore.FileState.read(source);
         File tmp = File.createTempFile(".apk-edit-", ".apk", source.getParentFile());
-        try { alignedWrite(module, tmp); FileStore.replace(tmp, source); }
+        try { alignedWrite(module, tmp); FileStore.publish(tmp, source, before); ArchiveOps.forget(source); }
         finally { Files.deleteIfExists(tmp.toPath()); }
     }
     static synchronized void align(File source, File output) throws IOException {
@@ -140,6 +141,7 @@ final class ApkTools {
         DexFileFactory.loadDexFile(dex, Opcodes.getDefault());
     }
     static void saveDexClass(File archive, String entry, String descriptor, String text, File cache) throws IOException {
+        FileStore.FileState before = FileStore.FileState.read(archive);
         File folder = Files.createTempDirectory(cache.toPath(), "smali-edit-").toFile();
         File original = entry.isEmpty() ? archive : new File(folder, "original.dex");
         File compiled = new File(folder, "class.dex"), merged = new File(folder, "merged.dex");
@@ -165,9 +167,37 @@ final class ApkTools {
                 public Opcodes getOpcodes() { return old.getOpcodes(); }
             });
             DexFileFactory.loadDexFile(merged, old.getOpcodes());
-            if (entry.isEmpty()) FileStore.replace(merged, archive);
-            else ArchiveOps.rewrite(archive, null, null, Map.of(entry, merged));
+            if (entry.isEmpty()) {
+                File temporary = File.createTempFile(".dex-edit-", ".dex", archive.getParentFile());
+                try {
+                    Files.copy(merged.toPath(), temporary.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    FileStore.publish(temporary, archive, before);
+                } finally { Files.deleteIfExists(temporary.toPath()); }
+            } else ArchiveOps.rewrite(archive, null, null, Map.of(entry, merged));
         } finally { removeWork(folder); }
+    }
+    static void disassembleClass(File archive, String entry, String descriptor, File output) throws IOException {
+        File folder = Files.createTempDirectory(output.getParentFile().toPath(), "class-rebuild-").toFile();
+        try {
+            File dex = archive;
+            if (!entry.isEmpty()) { dex = new File(folder, "source.dex"); ArchiveOps.extractOne(archive, entry, dex); }
+            File smali = new File(folder, "smali");
+            BaksmaliOptions options = new BaksmaliOptions(); options.apiLevel = 28; options.debugInfo = true;
+            if (!Baksmali.disassembleDexFile(DexFileFactory.loadDexFile(dex, Opcodes.getDefault()),
+                    smali, 1, options, List.of(descriptor))) throw new IOException("类反汇编失败");
+            File found = firstSmali(smali);
+            if (found == null) throw new IOException("原 DEX 中没有此类");
+            Files.copy(found.toPath(), output.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } finally { removeWork(folder); }
+    }
+    private static File firstSmali(File directory) {
+        File[] children = directory.listFiles();
+        if (children == null) return null;
+        for (File child : children) {
+            File found = child.isDirectory() ? firstSmali(child) : child.getName().endsWith(".smali") ? child : null;
+            if (found != null) return found;
+        }
+        return null;
     }
     private static void removeWork(File file) throws IOException {
         File[] children = file.listFiles();
