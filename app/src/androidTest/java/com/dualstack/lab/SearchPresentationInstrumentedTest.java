@@ -30,9 +30,11 @@ public class SearchPresentationInstrumentedTest {
     private ActivityScenario<MainActivity> scenario;
     private MainActivity activity;
     private Intent originalIntent;
+    private boolean rootAvailable;
 
     @Before public void setup() throws Exception {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        rootAvailable = RootAccess.available();
         device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation());
         work = Files.createTempDirectory(context.getCacheDir().toPath(), "search-ui-").toFile();
         folder = new File(work, "nested"); right = new File(work, "right");
@@ -65,7 +67,7 @@ public class SearchPresentationInstrumentedTest {
         main(() -> {
             Object pane = get(activity, "left");
             assertTrue(((Set<?>) get(pane, "selected")).isEmpty());
-            assertTrue(((FileStore.Node) get(pane, "location")).root);
+            assertEquals(rootAvailable, ((FileStore.Node) get(pane, "location")).root);
             TextView name = findText((View) get(pane, "list"), target.getName()); assertNotNull(name);
             assertEquals(Ui.HIT, name.getCurrentTextColor());
             View row = (View) name.getParent().getParent();
@@ -107,7 +109,7 @@ public class SearchPresentationInstrumentedTest {
         assertFalse(device.hasObject(By.text("使用 ROOT 访问")));
         find(By.res("android:id/button1")).click();
         await(() -> ready(folder));
-        main(() -> assertTrue(((FileStore.Node) get(get(activity, "left"), "location")).root));
+        main(() -> assertEquals(rootAvailable, ((FileStore.Node) get(get(activity, "left"), "location")).root));
     }
 
     @Test public void apkKeepsBothCompressAndExtractAndPacksOriginalFilename() throws Exception {

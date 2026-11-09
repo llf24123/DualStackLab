@@ -2,6 +2,8 @@ package com.dualstack.lab;
 
 import android.content.Context;
 import androidx.lifecycle.ViewModel;
+import io.github.rosemoe.sora.text.Content;
+import org.json.*;
 import java.io.*;
 import java.nio.file.Files;
 import java.util.*;
@@ -13,6 +15,8 @@ public final class EditorSession extends ViewModel {
     String document, baseline;
     File archive;
     volatile boolean saving;
+    // Main-thread edit generation, independent of EditorDrafts' persistence/clear tokens.
+    long contentRevision;
     private final Set<File> temporary = new HashSet<>();
     private final Set<File> emptyParents = new HashSet<>();
     private boolean closed, released;
@@ -35,10 +39,22 @@ public final class EditorSession extends ViewModel {
     synchronized void end() { operations--; cleanup(); }
     synchronized void own(File file) { temporary.add(file); }
     synchronized void ownParent(File parent) { emptyParents.add(parent); }
-    void saved() throws IOException {
-        try { drafts.clear().get(); memory = null; baseline = null; }
-        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
-        catch (ExecutionException failed) { throw new IOException("清理已保存草稿失败", failed.getCause()); }
+    /** Main-thread publication: an IO success only cleans the exact edit generation it captured. */
+    boolean saved(long savedRevision, String sourceRevision, long length, PagedTextFile.Page page) throws JSONException {
+        baseline = sourceRevision;
+        boolean clean = contentRevision == savedRevision;
+        EditorDrafts.State state = memory;
+        if (state != null) {
+            JSONObject data = new JSONObject(state.metadata().toString()).put("baseline", baseline)
+                    .put("dirty", !clean).put("time", System.currentTimeMillis());
+            if (length >= 0) data.put("length", length);
+            if (page != null) data.put("end", page.end());
+            if (clean) discard(); // Invalidates older queued checkpoints; never wait for the draft worker here.
+            memory = clean ? new EditorDrafts.State(drafts.id, state.document(), 0, data, new Content(""))
+                    : drafts.remember(state.document(), data, state.content());
+            if (!clean) drafts.persist(memory);
+        } else if (clean) discard();
+        return clean;
     }
     Future<?> discard() { memory = null; return drafts.clear(); }
     private synchronized void cleanup() {

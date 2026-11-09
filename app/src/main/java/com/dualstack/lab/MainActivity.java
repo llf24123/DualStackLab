@@ -21,6 +21,16 @@ import java.util.regex.Pattern;
 public class MainActivity extends LabActivity {
     private static final int TREE = 100, ARTIFACT = 200, INSTALLED = 400;
     private FileStore store;
+    private Operations operations;
+    private final Map<String, Integer> observedOutputs = new HashMap<>();
+    private final Map<String, String> observedStates = new HashMap<>();
+    private final Runnable tasksChanged = this::updateTasks;
+    private final Handler taskTicker = new Handler(Looper.getMainLooper());
+    private boolean taskUIStarted;
+    private final Runnable taskTick = new Runnable() { public void run() {
+        if (!taskUIStarted) return;
+        updateTaskStrip(); if (operations.active()) taskTicker.postDelayed(this, 500);
+    } };
     private AppIcons appIcons;
     private DirectoryPlaces directoryPlaces;
     private Pane left, right, active;
@@ -35,7 +45,7 @@ public class MainActivity extends LabActivity {
     private int externalGeneration;
     private String handledExternal;
     private boolean showHidden, comfortable;
-    private boolean busy, resumed;
+    private boolean resumed;
     private Boolean selectionActions;
     private final Map<String, DirectorySnapshot> directorySnapshots = new LinkedHashMap<>(24, .75f, true);
     private record DirectorySnapshot(List<FileStore.Node> nodes, Map<String, String> metadata, long space, long time) {}
@@ -45,6 +55,11 @@ public class MainActivity extends LabActivity {
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
         store = new FileStore(this); appIcons = new AppIcons(this);
+        operations = Operations.get(this);
+        for (Operations.Task task : operations.list()) {
+            synchronized (operations) { observedOutputs.put(task.id, task.active() ? 0 : task.outputs.size()); }
+            observedStates.put(task.id, task.state);
+        }
         if (saved != null && saved.getString("pendingInstall") != null) pendingInstall = new File(saved.getString("pendingInstall"));
         directoryPlaces = new DirectoryPlaces(this);
         showHidden = getPreferences(0).getBoolean("showHidden", true);
@@ -55,8 +70,8 @@ public class MainActivity extends LabActivity {
         top.addView(Ui.icon(this, R.drawable.ic_menu, "位置与工具", Color.WHITE, this::places), lp(48, 58));
         LinearLayout labels = Ui.column(this);
         title = Ui.single(this, "双栈 Lab", 18, Color.WHITE);
-        title.setOnClickListener(v -> jump());
-        title.setOnLongClickListener(v -> {
+        labels.setOnClickListener(v -> jump()); labels.setFocusable(true); labels.setContentDescription("路径跳转");
+        labels.setOnLongClickListener(v -> {
             if (active == null || active.location == null) return true;
             ((android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(
                     ClipData.newPlainText("目录路径", active.location.path()));
@@ -68,25 +83,26 @@ public class MainActivity extends LabActivity {
         labels.addView(title, lp(-1, 29)); labels.addView(subtitle, lp(-1, 20));
         top.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
         moreButton = Ui.icon(this, R.drawable.ic_more, "更多操作", Color.WHITE, this::more);
-        top.addView(moreButton, lp(44, 54));
+        top.addView(moreButton, lp(48, 54));
         root.addView(top, lp(-1, 58));
         permission = Ui.row(this);
         permission.setPadding(dp(12), 0, dp(6), 0); permission.setBackgroundColor(Ui.WARNING);
         TextView explain = Ui.text(this, "存储访问权限未开启", 12, Ui.TEXT);
-        permission.addView(explain, new LinearLayout.LayoutParams(0, dp(40), 1));
+        permission.addView(explain, new LinearLayout.LayoutParams(0, dp(48), 1));
         TextView allow = Ui.text(this, "开启权限", 12, Ui.ACCENT);
         allow.setPadding(dp(10), 0, dp(10), 0); allow.setOnClickListener(v -> storagePermission());
-        permission.addView(allow, lp(-2, 40)); root.addView(permission);
+        permission.addView(allow, lp(-2, 48)); root.addView(permission);
         LinearLayout panes = new DualPaneLayout(this); panes.setBackgroundColor(Ui.SURFACE);
         left = new Pane(true); right = new Pane(false);
         panes.addView(left, new LinearLayout.LayoutParams(0, -1, 1));
         panes.addView(right, new LinearLayout.LayoutParams(0, -1, 1));
         root.addView(panes, new LinearLayout.LayoutParams(-1, 0, 1));
         root.addView(Ui.line(this));
-        status = Ui.single(this, "准备就绪", 10, Ui.MUTED);
+        status = Ui.single(this, "任务中心 · 暂无任务", 12, Ui.MUTED);
         status.setPadding(dp(12), 0, dp(12), 0); status.setBackgroundColor(Ui.PANEL);
-        root.addView(status, lp(-1, 20));
-        status.setVisibility(View.GONE);
+        root.addView(status, lp(-1, 48));
+        status.setContentDescription("打开任务中心"); status.setFocusable(true);
+        status.setOnClickListener(v -> startActivity(new Intent(this, TaskCenterActivity.class)));
         DirectorySheet.SwipeLayout actionGestures = new DirectorySheet.SwipeLayout(this, true, this::directorySheet);
         actions = actionGestures;
         actionGestures.setDragCallbacks(() -> { directorySheet(true); },
@@ -99,7 +115,10 @@ public class MainActivity extends LabActivity {
         restore(left, saved); restore(right, saved);
         if (saved != null) handledExternal = saved.getString("handledExternal");
         if (saved == null || ExternalFiles.uri(getIntent()) != null) navigateIntent(getIntent());
-        if (saved == null) EditorDrafts.WORKER.execute(() -> EditorDrafts.prune(getApplicationContext(), 14L * 24 * 60 * 60 * 1000));
+        if (saved == null) {
+            EditorDrafts.WORKER.execute(() -> EditorDrafts.prune(getApplicationContext(), 14L * 24 * 60 * 60 * 1000));
+            SafRecovery.offerPending(this);
+        }
     }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent); setIntent(intent); externalGeneration++; handledExternal = null; navigateIntent(intent);
@@ -140,7 +159,7 @@ public class MainActivity extends LabActivity {
                             left.reveal = received.node().name;
                             left.navigate(FileStore.directory(received.directory(), received.node().root));
                         } else {
-                            status.setVisibility(View.GONE);
+                            updateTaskStrip();
                             Tasks.toast(this, "来源未提供可访问的实际目录，直接打开原文件");
                             open(received.node());
                         }
@@ -201,6 +220,12 @@ public class MainActivity extends LabActivity {
             File file = pendingInstall; pendingInstall = null; startNormalInstall(file);
         }
     }
+    @Override protected void onStart() {
+        super.onStart(); taskUIStarted = true; operations.listen(tasksChanged); updateTasks();
+    }
+    @Override protected void onStop() {
+        taskUIStarted = false; operations.unlisten(tasksChanged); taskTicker.removeCallbacksAndMessages(null); super.onStop();
+    }
     private boolean hasStorage() {
         return Build.VERSION.SDK_INT >= 30 ? Environment.isExternalStorageManager() :
                 checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
@@ -242,7 +267,7 @@ public class MainActivity extends LabActivity {
         subtitle.setText("目录 " + folders + "  文件 " + (active.entries.size() - folders)
                 + (active.location.file != null && !active.location.root ?
                 " · 可用 " + FileStore.size(active.usableSpace) : ""));
-        title.setText(busy ? "正在处理…" : active.location.path() + (active.location.file != null
+        title.setText(active.location.path() + (active.location.file != null
                 && !active.location.path().endsWith("/") ? "/" : ""));
         title.setContentDescription("双栈 Lab · " + active.location.path());
     }
@@ -255,7 +280,7 @@ public class MainActivity extends LabActivity {
         selectionActions = selection;
         if (rebuild) actions.removeAllViews();
         if (modeChanged && actions.isShown()) Ui.fadeIn(actions);
-        status.setVisibility(active.selected.isEmpty() && !busy ? View.GONE : View.VISIBLE);
+        status.setVisibility(View.VISIBLE);
         if (selection) {
             if (rebuild) {
                 View all = addSelectionAction(R.drawable.ic_select_all, "全选", () -> active.selectAll());
@@ -287,7 +312,50 @@ public class MainActivity extends LabActivity {
             actions.getChildAt(1).setEnabled(!active.forwardHistory.isEmpty());
             actions.getChildAt(1).setAlpha(active.forwardHistory.isEmpty() ? .28f : 1f);
             actions.getChildAt(4).setRotation(active == left ? 0 : 180);
+            updateTaskStrip();
         }
+    }
+    private void updateTaskStrip() {
+        if (status == null || operations == null || active == null || !active.selected.isEmpty()) return;
+        List<Operations.Task> tasks = operations.list(); Operations.Task current = null;
+        for (Operations.Task task : tasks) if (task.active()) { if (current == null || task.state.equals("处理中")) current = task; }
+        if (current == null && !tasks.isEmpty()) current = tasks.get(0);
+        String label = current == null ? "任务中心 · 暂无任务" : current.spec.kind + " · " + current.state + " · " + FileStore.size(current.bytes()) + " · 点按查看";
+        if (!TextUtils.equals(status.getText(), label)) status.setText(label);
+        status.setVisibility(View.VISIBLE);
+    }
+    private boolean enqueue(Operations.Spec spec, Pane target) {
+        try {
+            spec.targetPane = target == null ? -1 : target == left ? 0 : 1;
+            Operations.Task task = operations.enqueue(spec); observedOutputs.put(task.id, 0); observedStates.put(task.id, task.state);
+            if (active != null) { active.resetSelection(); active.selectionChanged(); }
+            updateTasks(); Tasks.toast(this, "已加入任务中心，可继续浏览");
+            return true;
+        } catch (Exception error) { Tasks.showError(this, error); return false; }
+    }
+    private void updateTasks() {
+        if (operations == null || left == null || isFinishing() || isDestroyed()) return;
+        boolean reloadLeft = false, reloadRight = false;
+        for (Operations.Task task : operations.list()) {
+            List<String> outputs;
+            synchronized (operations) { outputs = new ArrayList<>(task.outputs); }
+            int seen = observedOutputs.getOrDefault(task.id, 0);
+            String previous = observedStates.put(task.id, task.state);
+            if (outputs.size() > seen && !task.active()) {
+                Pane target = task.spec.targetPane == 0 ? left : task.spec.targetPane == 1 ? right : null;
+                if (target != null && target.location != null && target.location.key().replaceFirst("^root:", "").equals(task.spec.destination.replaceFirst("^root:", ""))) {
+                    target.resultHighlights.addAll(outputs.subList(seen, outputs.size()));
+                    for (String key : outputs.subList(seen, outputs.size())) target.resultHighlights.add(key.replaceFirst("^root:", ""));
+                    if (target == left) reloadLeft = true; else reloadRight = true;
+                }
+                observedOutputs.put(task.id, outputs.size());
+            }
+            if (previous != null && !previous.equals(task.state) && !task.active()) { reloadLeft = true; reloadRight = true; }
+        }
+        if (reloadLeft || reloadRight) directorySnapshots.clear();
+        if (reloadLeft) left.reload(); if (reloadRight) right.reload(); updateTaskStrip();
+        taskTicker.removeCallbacks(taskTick);
+        if (taskUIStarted && operations.active()) taskTicker.postDelayed(taskTick, 500);
     }
     private void synchronizeOtherPane() {
         if (active == null || active.location == null) return;
@@ -316,7 +384,13 @@ public class MainActivity extends LabActivity {
     private Pane other() { return active == left ? right : left; }
     private void places() {
         drawer = NavigationDrawer.show(this, () -> navigateDirectory(new File("/"), true),
-                () -> active.navigate(FileStore.directory(Environment.getExternalStorageDirectory(), false)), this::installed);
+                () -> active.navigate(FileStore.directory(Environment.getExternalStorageDirectory(), false)), this::installed, this::recycleBin);
+    }
+    private void recycleBin() {
+        Intent intent = new Intent(this, RecycleBinActivity.class);
+        if (active != null && active.location != null && active.location.file != null)
+            intent.putExtra("suggestedDirectory", active.location.file.getAbsolutePath());
+        startActivity(intent);
     }
     private void navigateDirectory(File path, boolean preferRoot) {
         Pane target = active;
@@ -347,16 +421,16 @@ public class MainActivity extends LabActivity {
         startActivityForResult(intent, TREE + (active == left ? 0 : 1));
     }
     private void more() {
-        String[] names = {"刷新", "搜索", "全选", "反选当前列表", "过滤", "排序方式", "打开终端", "隐藏文件", "添加书签", "设为首页", "交换窗口", "设置", "退出"};
+        String[] names = {"刷新", "搜索", "全选", "反选当前列表", "过滤", "排序方式", "打开终端", "隐藏文件", "添加书签", "设为首页", "交换窗口", "设置", "退出", "最近与书签", "按条件选择", "任务中心"};
         int[] icons = {R.drawable.ic_refresh, R.drawable.ic_search, R.drawable.ic_select_all, R.drawable.ic_check,
                 R.drawable.ic_filter, R.drawable.ic_sort, R.drawable.ic_terminal, R.drawable.ic_eye, R.drawable.ic_bookmark,
-                R.drawable.ic_home, R.drawable.ic_swap, R.drawable.ic_settings, R.drawable.ic_exit};
+                R.drawable.ic_home, R.drawable.ic_swap, R.drawable.ic_settings, R.drawable.ic_exit, R.drawable.ic_bookmark, R.drawable.ic_filter, R.drawable.ic_copy};
         if (active.location.container != null) {
             names = Arrays.copyOf(names, names.length + 1); names[names.length - 1] = "解压当前目录";
             icons = Arrays.copyOf(icons, icons.length + 1); icons[icons.length - 1] = R.drawable.ic_download;
         }
         LinearLayout menu = Ui.column(this); menu.setBackgroundColor(Ui.SURFACE);
-        ScrollView scroll = new ScrollView(this); scroll.addView(menu);
+        ScrollView scroll = new ScrollView(this); scroll.setContentDescription("更多操作列表"); scroll.addView(menu);
         int screenHeight = getResources().getDisplayMetrics().heightPixels;
         PopupWindow popup = new PopupWindow(scroll, Math.min(dp(232), Math.round(getResources().getDisplayMetrics().widthPixels * .56f)),
                 Math.min(dp(names.length * 48), screenHeight - dp(100)), true);
@@ -389,7 +463,10 @@ public class MainActivity extends LabActivity {
             case 10 -> { FileStore.Node a = left.location, b = right.location; left.navigate(b); right.navigate(a); }
             case 11 -> settings();
             case 12 -> finish();
-            case 13 -> extractDialog(List.of(active.location));
+            case 13 -> directorySheet();
+            case 14 -> conditionalSelection();
+            case 15 -> startActivity(new Intent(this, TaskCenterActivity.class));
+            case 16 -> extractDialog(List.of(active.location));
         }
     }
     private void invertVisibleSelection() {
@@ -408,10 +485,11 @@ public class MainActivity extends LabActivity {
                 }).show();
     }
     private void settings() {
-        new AlertDialog.Builder(this).setTitle("设置").setItems(new String[]{"主题", "隐藏文件", "列表密度", "恢复默认首页"}, (d, n) -> {
+        new AlertDialog.Builder(this).setTitle("设置").setItems(new String[]{"主题", "隐藏文件", "列表密度", "备份与回收站", "恢复默认首页"}, (d, n) -> {
             if (n == 0) Ui.chooseTheme(this);
             else if (n == 1) hiddenOptions();
             else if (n == 2) densityOptions();
+            else if (n == 3) recycleBin();
             else new AlertDialog.Builder(this).setTitle("恢复默认首页？").setMessage("左右窗口下次启动都会回到内部存储。")
                     .setNegativeButton("取消", null).setPositiveButton("恢复", (confirm, x) -> {
                         getPreferences(0).edit().remove("home-left").remove("home-right").apply();
@@ -489,7 +567,9 @@ public class MainActivity extends LabActivity {
                 .setNegativeButton("取消", null).setPositiveButton("创建", null).create();
         dialog.setOnShowListener(v -> dialog.getButton(-1).setOnClickListener(x -> {
             String value = name.getText().toString(); boolean folder = type.getSelectedItemPosition() == 1;
-            mutate(() -> store.create(pane.location, value, folder), n -> { dialog.dismiss(); pane.reload(); });
+            Operations.Spec spec = Operations.Spec.of(Operations.CREATE, List.of(), pane.location, value); spec.folder = folder;
+            try { FileStore.checkName(value); } catch (IOException error) { name.setError(error.getMessage()); return; }
+            if (enqueue(spec, pane)) dialog.dismiss();
         })); dialog.show();
     }
     private void selectionMenu() {
@@ -508,7 +588,7 @@ public class MainActivity extends LabActivity {
         close.setContentDescription("关闭文件操作"); close.setBackground(Ui.ripple(Ui.SURFACE));
         Runnable clear = () -> { source.resetSelection(); source.selectionChanged(); };
         close.setOnClickListener(v -> { clear.run(); dialog.dismiss(); });
-        heading.addView(close, lp(36, 34)); body.addView(heading); body.addView(Ui.line(this));
+        heading.addView(close, lp(48, 48)); body.addView(heading); body.addView(Ui.line(this));
         String[] labels = {"复制", "移动", "删除", "重命名", "工具", "压缩", "解压", "属性", "分享", "打开方式…", "添加书签"};
         int[] icons = {R.drawable.ic_copy, R.drawable.ic_cut, R.drawable.ic_trash, R.drawable.ic_edit,
                 R.drawable.ic_tools, R.drawable.ic_download, R.drawable.ic_archive, R.drawable.ic_info,
@@ -516,7 +596,7 @@ public class MainActivity extends LabActivity {
         // Archives keep both choices: packing the archive itself is as valid as unpacking it.
         boolean extraction = nodes.stream().allMatch(n -> n.container != null)
                 || single && !node.directory && (isArchive(node.name.toLowerCase(Locale.ROOT)) || ApkInstall.isApkName(node.name));
-        boolean[] enabled = {!busy, !busy, !busy, single && !busy, single, !busy, extraction && !busy, single, files,
+        boolean[] enabled = {true, true, true, single, single, true, extraction, single, files,
                 single && !node.directory, single && node.directory};
         Runnable[] run = {() -> transfer(nodes, source, target, false), () -> transfer(nodes, source, target, true),
                 this::deleteSelection, () -> rename(node), () -> fileTools(node), () -> compress(nodes),
@@ -566,9 +646,7 @@ public class MainActivity extends LabActivity {
             File target = new File(path.getText().toString().trim());
             if (!target.isAbsolute()) { path.setError("请输入绝对路径"); return; }
             FileStore.Node destination = FileStore.directory(target, source.location.root);
-            mutate(() -> { store.copyAll(nodes, destination, move); return true; }, done -> {
-                dialog.dismiss(); source.selected.clear(); left.reload(); right.reload(); actionBar(); Tasks.toast(this, "操作完成");
-            });
+            if (enqueue(Operations.Spec.of(move ? Operations.MOVE : Operations.COPY, nodes, destination, null), source)) dialog.dismiss();
         })); dialog.show();
     }
     private void fileTools(FileStore.Node node) {
@@ -639,10 +717,11 @@ public class MainActivity extends LabActivity {
         Pane pane = active; EditText name = Ui.input(this, "文件名"); name.setText(node.name);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("重命名").setView(name)
                 .setNegativeButton("取消", null).setPositiveButton("保存", null).create();
-        dialog.setOnShowListener(v -> dialog.getButton(-1).setOnClickListener(x ->
-                mutate(() -> store.rename(node, name.getText().toString()), done -> {
-                    dialog.dismiss(); pane.selected.clear(); pane.reload(); actionBar();
-                }))); dialog.show();
+        dialog.setOnShowListener(v -> dialog.getButton(-1).setOnClickListener(x -> {
+            String value = name.getText().toString();
+            try { FileStore.checkName(value); } catch (IOException error) { name.setError(error.getMessage()); return; }
+            if (enqueue(Operations.Spec.of(Operations.RENAME, List.of(node), pane.location, value), pane)) dialog.dismiss();
+        })); dialog.show();
     }
     private void properties(FileStore.Node node) {
         FilePermissions.show(this, node, date.format(new Date(node.modified)), () -> { left.reload(); right.reload(); });
@@ -650,14 +729,9 @@ public class MainActivity extends LabActivity {
     private void deleteSelection() {
         Pane pane = active; List<FileStore.Node> nodes = pane.chosen();
         new AlertDialog.Builder(this).setTitle("删除 " + nodes.size() + " 项？")
-                .setMessage("将永久删除所选文件及目录。").setNegativeButton("取消", null)
-                .setPositiveButton("删除", (d, w) -> mutate(() -> {
-                    try { store.deleteAll(nodes); return nodes.size(); }
-                    finally { runOnUiThread(() -> {
-                        if (isDestroyed() || isFinishing()) return;
-                        pane.selected.clear(); directorySnapshots.clear(); left.reload(); right.reload(); actionBar();
-                    }); }
-                }, n -> Tasks.toast(this, "已删除 " + n + " 项"))).show();
+                .setMessage("删除前会生成完整备份，可在左侧菜单的回收站恢复。备份失败或来源变化时保留原件。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("删除", (d, w) -> enqueue(Operations.Spec.of(Operations.DELETE, nodes, pane.location, null), pane)).show();
     }
     private void transfer(Pane source, Pane target, boolean move) {
         transfer(source.chosen(), source, target, move);
@@ -665,49 +739,7 @@ public class MainActivity extends LabActivity {
     private void transfer(List<FileStore.Node> nodes, Pane source, Pane target, boolean move) {
         if (nodes.isEmpty()) { Tasks.toast(this, "先长按选择文件"); return; }
         FileStore.Node destination = target.location;
-        mutate(() -> store.copyAll(nodes, destination, move).size(),
-                n -> { source.selected.clear(); source.reload(); target.reload(); actionBar();
-                    status.setText((move ? "移动" : "复制") + "完成 · " + n + " 项"); });
-    }
-    /** Runs one file operation; after 400 ms a dialog shows item progress and lets the user stop at the next item. */
-    private <T> void mutate(Tasks.Job<T> job, Tasks.Done<T> done) {
-        if (busy) { Tasks.toast(this, "请等待当前操作完成"); return; }
-        busy = true; header();
-        Tasks.Progress progress = new Tasks.Progress();
-        TextView detail = Ui.text(this, "准备中…", 13, Ui.TEXT);
-        detail.setPadding(dp(20), dp(8), dp(20), dp(4));
-        detail.setMaxLines(3); detail.setContentDescription("操作进度");
-        ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        bar.setIndeterminate(true);
-        LinearLayout body = Ui.column(this); body.addView(detail);
-        LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(-1, -2);
-        barParams.setMargins(dp(20), dp(4), dp(20), dp(8)); body.addView(bar, barParams);
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("正在处理").setView(body).setCancelable(false)
-                .setNegativeButton("取消", null).create();
-        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
-            progress.cancelled.set(true); detail.setText("正在停止，当前项目完成后结束…");
-            v.setEnabled(false);
-        }));
-        boolean[] finished = {false};
-        Runnable[] tick = new Runnable[1];
-        tick[0] = () -> {
-            if (finished[0] || isDestroyed()) return;
-            if (!dialog.isShowing()) dialog.show();
-            if (!progress.cancelled.get()) detail.setText("已处理 " + progress.done.get() + " 项\n" + progress.current);
-            detail.postDelayed(tick[0], 250);
-        };
-        detail.postDelayed(tick[0], 400);
-        Runnable close = () -> { finished[0] = true; detail.removeCallbacks(tick[0]); if (dialog.isShowing()) dialog.dismiss(); };
-        Tasks.run(this, () -> {
-            try { return progress.run(job); }
-            finally { runOnUiThread(() -> { busy = false; directorySnapshots.clear(); header(); }); }
-        }, value -> { close.run(); done.accept(value); }, error -> {
-            close.run();
-            if (error instanceof Tasks.CancelledException) {
-                left.reload(); right.reload(); actionBar();
-                Tasks.toast(this, "已取消，未完成的项目已撤回");
-            } else Tasks.showError(this, error);
-        });
+        enqueue(Operations.Spec.of(move ? Operations.MOVE : Operations.COPY, nodes, destination, null), target);
     }
     private void compress(List<FileStore.Node> nodes) {
         Pane pane = active; FileStore.Node destination = pane.location;
@@ -716,6 +748,7 @@ public class MainActivity extends LabActivity {
         Spinner formats = new Spinner(this); formats.setContentDescription("压缩格式");
         formats.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"ZIP", "TAR", "TAR.GZ", "7Z"}));
         EditText password = Ui.input(this, "压缩密码（留空不加密）"); password.setContentDescription("压缩密码");
+        password.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
         password.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
         TextView note = Ui.text(this, "ZIP 密码使用 AES-256 加密", 12, Ui.MUTED);
         body.addView(name); body.addView(formats); body.addView(password); body.addView(note);
@@ -736,17 +769,9 @@ public class MainActivity extends LabActivity {
             try { FileStore.checkName(fileName); } catch (IOException error) { name.setError(error.getMessage()); return; }
             String format = new String[]{"zip", "tar", "tar.gz", "7z"}[formats.getSelectedItemPosition()];
             char[] secret = password.getText().toString().toCharArray();
-            dialog.dismiss();
-            mutate(() -> {
-                File tmp = File.createTempFile("pack-", "." + format, getCacheDir());
-                try {
-                    ArchiveOps.pack(store, nodes, tmp, format, secret);
-                    FileStore.Node out = store.create(destination, fileName, false);
-                    try { store.write(out, tmp); } catch (IOException error) { store.delete(out); throw error; }
-                    if (secret.length > 0 && out.file != null) ArchiveOps.setPassword(out.file, secret);
-                    return true;
-                } finally { Arrays.fill(secret, '\0'); java.nio.file.Files.deleteIfExists(tmp.toPath()); }
-            }, ok -> { pane.reload(); Tasks.toast(this, "压缩完成"); });
+            Operations.Spec spec = Operations.Spec.of(Operations.PACK, nodes, destination, fileName);
+            spec.format = format; spec.passwordRequired = secret.length > 0; spec.password = secret.clone(); Arrays.fill(secret, '\0');
+            if (enqueue(spec, pane)) dialog.dismiss(); else Arrays.fill(spec.password, '\0');
         })); dialog.show();
     }
     private void extractDialog(List<FileStore.Node> nodes) {
@@ -772,21 +797,21 @@ public class MainActivity extends LabActivity {
                 destination = FileStore.directory(value, initial.root && initial.file.equals(value));
             }
             FileStore.Node outputParent = destination;
-            mutate(() -> store.extract(nodes, outputParent, folder), output -> {
-                dialog.dismiss(); source.selected.clear(); source.reload();
-                target.reveal = output.name; target.navigate(outputParent);
-                Tasks.toast(this, "解压完成 · " + output.path()); actionBar();
-            });
+            if (enqueue(Operations.Spec.of(Operations.EXTRACT, nodes, outputParent, folder), target)) dialog.dismiss();
         })); dialog.show();
     }
     private void open(FileStore.Node node) {
         String name = node.name.toLowerCase(Locale.ROOT);
         if (ApkInstall.isApkName(name)) { apkDialog(node); return; }
         if (isArchive(name)) {
-            if (node.file != null && ArchiveOps.isEncrypted(node.file) && !ArchiveOps.hasPassword(node.file)) {
-                promptPassword(node.file, () -> browseArchive(node)); return;
-            }
-            browseArchive(node); return;
+            Pane target = active; int generation = target.generation;
+            Runnable browse = () -> { if (active == target && target.generation == generation) browseArchive(node); };
+            Tasks.run(this, Tasks.BROWSE, () -> node.file != null && ArchiveOps.isEncrypted(node.file)
+                    && !ArchiveOps.hasPassword(node.file), required -> {
+                if (active != target || target.generation != generation) return;
+                if (required) promptPassword(node.file, browse); else browse.run();
+            }, error -> Tasks.showError(this, error));
+            return;
         }
         if (node.container != null && name.endsWith(".xml")) {
             if (node.container.name.toLowerCase(Locale.ROOT).endsWith(".rar")) { readOnlyText(node); return; }
@@ -1091,6 +1116,8 @@ public class MainActivity extends LabActivity {
         final Adapter adapter;
         final List<FileStore.Node> all = new ArrayList<>(), entries = new ArrayList<>();
         final Set<String> selected = new HashSet<>();
+        final Set<String> resultHighlights = new HashSet<>();
+        long highlightUntil;
         final ArrayDeque<FileStore.Node> backHistory = new ArrayDeque<>(), forwardHistory = new ArrayDeque<>();
         FileStore.Node location;
         String filter = "";
@@ -1111,10 +1138,10 @@ public class MainActivity extends LabActivity {
             TextView label = Ui.text(MainActivity.this, isLeft ? "L" : "R", 10, Ui.ACCENT);
             label.setTypeface(null, android.graphics.Typeface.BOLD); heading.addView(label, lp(16, 30));
             path = Ui.single(MainActivity.this, "内部存储", 12, Ui.TEXT);
-            heading.addView(path, new LinearLayout.LayoutParams(0, dp(30), 1));
+            heading.addView(path, new LinearLayout.LayoutParams(0, dp(48), 1));
             path.setOnClickListener(v -> { activate(this); jump(); });
             heading.addView(Ui.icon(MainActivity.this, R.drawable.ic_more, "窗口菜单", Ui.MUTED,
-                    () -> { activate(this); more(); }), lp(30, 30));
+                    () -> { activate(this); more(); }), lp(48, 48));
             heading.setVisibility(GONE); addView(heading);
             FrameLayout frame = new FrameLayout(MainActivity.this);
             list = new SwipeSelectListView(MainActivity.this); list.setDivider(null); list.setFastScrollEnabled(false);
@@ -1127,6 +1154,7 @@ public class MainActivity extends LabActivity {
             frame.addView(empty, new FrameLayout.LayoutParams(-1, -1)); list.setEmptyView(empty);
             hint = Ui.text(MainActivity.this, "", 12, Ui.MUTED); hint.setGravity(Gravity.CENTER);
             hint.setPadding(dp(12), dp(10), dp(12), dp(10)); hint.setVisibility(GONE);
+            hint.setMinimumHeight(dp(48));
             hint.setOnClickListener(v -> { if (!filter.isEmpty()) { filter = ""; apply(); } });
             FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(-1, -2, Gravity.TOP);
             hintParams.topMargin = rowHeight() + dp(8); frame.addView(hint, hintParams);
@@ -1398,6 +1426,17 @@ public class MainActivity extends LabActivity {
                             reveal = null;
                         }
                         scrollToMark();
+                        if (!resultHighlights.isEmpty()) {
+                            for (int i = 0; i < entries.size(); i++) if (resultHighlights.contains(entries.get(i).key()) || resultHighlights.contains(rowIdentity(entries.get(i)))) {
+                                list.setSelectionFromTop(i + 1, dp(12)); break;
+                            }
+                            long stamp = highlightUntil = SystemClock.uptimeMillis() + 1400;
+                            adapter.notifyDataSetChanged();
+                            list.postDelayed(() -> {
+                                if (highlightUntil != stamp) return;
+                                resultHighlights.clear(); highlightUntil = 0; adapter.notifyDataSetChanged();
+                            }, 1400);
+                        }
                         if (!current.key().equals(recordedDirectory)) {
                             directoryPlaces.visit(current); recordedDirectory = current.key();
                         }
@@ -1456,11 +1495,12 @@ public class MainActivity extends LabActivity {
                 else holder = (Row) reuse.getTag();
                 boolean checked = n != null && selected.contains(n.key());
                 boolean marked = n != null && rowIdentity(n).equals(Pane.this.marked);
+                boolean result = n != null && (resultHighlights.contains(n.key()) || resultHighlights.contains(rowIdentity(n))) && SystemClock.uptimeMillis() < highlightUntil;
                 // Only a row that keeps its file and changes selection animates; recycled rows switch at once.
                 boolean toggled = n != null && n == holder.node && checked != holder.checked;
                 holder.node = n; holder.checked = checked;
-                holder.showSelection(checked, toggled);
-                holder.name.setTextColor(marked ? Ui.HIT : Ui.TEXT);
+                holder.showSelection(checked || result, toggled);
+                holder.name.setTextColor(marked || result ? Ui.HIT : Ui.TEXT);
                 boolean apk = n != null && ApkInstall.isApkName(n.name);
                 boolean archive = n != null && isArchive(n.name.toLowerCase(Locale.ROOT));
                 int color = n == null || n.directory ? Ui.ICON_BG : apk ? Ui.ACCENT : archive ? Ui.GOLD : 0xff4374b3;
@@ -1469,6 +1509,8 @@ public class MainActivity extends LabActivity {
                 if (holder.drawable != drawable) { holder.icon.setImageResource(drawable); holder.drawable = drawable; }
                 holder.iconBackground.setColor(color);
                 holder.icon.setContentDescription(n == null ? "上级目录" : "选择 " + n.name);
+                holder.iconFrame.setContentDescription(n == null ? "上级目录" : "选择 " + n.name);
+                holder.iconFrame.setSelected(checked);
                 holder.icon.setSelected(checked);
                 holder.name.setText(n == null ? ".." : n.name);
                 holder.meta.setText(n == null ? "" : metadata.get(n.key()));
@@ -1494,10 +1536,11 @@ public class MainActivity extends LabActivity {
                     int to = on ? Ui.TINT : Ui.SURFACE;
                     android.content.res.ColorStateList current = background.getColor();
                     int from = current == null ? to : current.getDefaultColor();
-                    if (!animate || from == to || !row.isShown()) {
+                    if (!animate || from == to || !row.isShown() || !Ui.motionEnabled()) {
                         background.setColor(to); icon.animate().cancel(); icon.setScaleX(1f); icon.setScaleY(1f); return;
                     }
                     tint = android.animation.ValueAnimator.ofArgb(from, to).setDuration(Ui.MOTION_SHORT);
+                    tint.setInterpolator(Ui.EASING);
                     tint.addUpdateListener(a -> background.setColor((int) a.getAnimatedValue()));
                     tint.addListener(new android.animation.AnimatorListenerAdapter() {
                         @Override public void onAnimationCancel(android.animation.Animator a) { background.setColor(to); }
@@ -1505,8 +1548,7 @@ public class MainActivity extends LabActivity {
                     tint.start();
                     if (on) {
                         icon.animate().cancel(); icon.setScaleX(.78f); icon.setScaleY(.78f);
-                        icon.animate().scaleX(1f).scaleY(1f).setDuration(220)
-                                .setInterpolator(new android.view.animation.OvershootInterpolator(2.2f)).start();
+                        icon.animate().scaleX(1f).scaleY(1f).setDuration(Ui.MOTION_SHORT).setInterpolator(Ui.EASING).start();
                     }
                 }
                 void bindAppBadge(FileStore.Node entry, boolean checked) {
@@ -1546,7 +1588,17 @@ public class MainActivity extends LabActivity {
                         if (!list.isEnabled()) return;
                         activate(Pane.this); if (node == null) up(); else toggle(node);
                     };
-                    icon.setOnClickListener(select); iconFrame.setOnClickListener(select);
+                    icon.setClickable(false); icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                    // Input-focusable descendants suppress ListView's row click/long-click handling.
+                    // Accessibility focus still reaches this clickable checkable target.
+                    iconFrame.setOnClickListener(select); iconFrame.setFocusable(false);
+                    iconFrame.setContentDescription("选择文件");
+                    iconFrame.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+                        @Override public void onInitializeAccessibilityNodeInfo(View host, android.view.accessibility.AccessibilityNodeInfo info) {
+                            super.onInitializeAccessibilityNodeInfo(host, info);
+                            info.setClassName("android.widget.CheckBox"); info.setCheckable(node != null); info.setChecked(checked);
+                        }
+                    });
                     View.OnLongClickListener drag = v -> {
                         if (node == null || !list.isEnabled()) return false;
                         activate(Pane.this);
@@ -1556,7 +1608,7 @@ public class MainActivity extends LabActivity {
                                 new View.DragShadowBuilder(row), new DragItems(Pane.this, nodes), 0)) refresh.setEnabled(true);
                         return true;
                     };
-                    icon.setOnLongClickListener(drag); iconFrame.setOnLongClickListener(drag);
+                    iconFrame.setOnLongClickListener(drag);
                 }
             }
         }

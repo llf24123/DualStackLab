@@ -46,8 +46,8 @@ public class InstalledAppsActivity extends LabActivity {
         toolbar.addView(Ui.icon(this, R.drawable.ic_search, "搜索应用", Color.WHITE, () -> {
             query.setVisibility(query.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
             if (query.getVisibility() == View.VISIBLE) query.requestFocus(); else query.setText("");
-        }), lp(44, 52));
-        toolbar.addView(Ui.icon(this, R.drawable.ic_more, "应用列表菜单", Color.WHITE, this::menu), lp(44, 52));
+        }), lp(48, 52));
+        toolbar.addView(Ui.icon(this, R.drawable.ic_more, "应用列表菜单", Color.WHITE, this::menu), lp(48, 52));
         body.addView(toolbar, lp(-1, 52));
         LinearLayout modes = Ui.row(this); modes.setBackgroundColor(Ui.INK);
         for (int i = 0; i < 2; i++) {
@@ -174,7 +174,7 @@ public class InstalledAppsActivity extends LabActivity {
         Drawable cached = icons.get(app.name()); if (cached != null) icon.setImageDrawable(cached); else icon.setImageResource(R.drawable.ic_app);
         heading.addView(icon, lp(54, 54)); LinearLayout names = Ui.column(this);
         TextView name = Ui.single(this, app.label, 20, Ui.TEXT), version = Ui.single(this, app.version(), 14, Ui.MUTED);
-        names.addView(name, lp(-1, 32)); names.addView(version, lp(-1, 24));
+        names.addView(name, lp(-1, 48)); names.addView(version, lp(-1, 48));
         LinearLayout.LayoutParams space = new LinearLayout.LayoutParams(0, -2, 1); space.leftMargin = Ui.dp(this, 12); heading.addView(names, space);
         name.setOnLongClickListener(v -> { copy(app.label); return true; }); version.setOnLongClickListener(v -> { copy(app.version()); return true; });
         icon.setOnLongClickListener(v -> { copy(app.name()); return true; }); body.addView(heading);
@@ -209,7 +209,7 @@ public class InstalledAppsActivity extends LabActivity {
         LinearLayout row = Ui.row(this); TextView key = Ui.single(this, label, 15, Ui.TEXT);
         TextView text = Ui.single(this, value == null ? "?" : value, 14, Ui.MUTED); text.setEllipsize(TextUtils.TruncateAt.END);
         text.setContentDescription("应用详情 " + label); values.put(label, text);
-        row.addView(key, lp(103, 27)); row.addView(text, new LinearLayout.LayoutParams(0, Ui.dp(this, 27), 1));
+        row.addView(key, lp(103, 48)); row.addView(text, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
         View.OnLongClickListener copy = v -> { copy(text.getText().toString()); return true; };
         row.setOnLongClickListener(copy); key.setOnLongClickListener(copy); text.setOnLongClickListener(copy);
         if (click != null) { row.setOnClickListener(v -> click.run()); text.setOnClickListener(v -> click.run()); key.setOnClickListener(v -> click.run()); }

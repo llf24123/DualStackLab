@@ -43,9 +43,19 @@ final class ArchiveOps {
     }
     static boolean isEncrypted(File file) { return isEncryptedZip(file); }
     static synchronized boolean hasPassword(File file) { return password(file) != null; }
-    private static boolean isEncryptedZip(File file) {
+    private static synchronized boolean isEncryptedZip(File file) {
         if (isRar(file) || ArchiveFormats.supported(file)) return false;
-        try { return new net.lingala.zip4j.ZipFile(file).isEncrypted(); }
+        try {
+            String key = file.getCanonicalPath(); Stamp current = stamp(file);
+            Fallback checked = encryptionChecks.get(key);
+            if (checked != null && checked.stamp.equals(current)) return checked.encrypted;
+            try (net.lingala.zip4j.ZipFile zip = new net.lingala.zip4j.ZipFile(file)) {
+                boolean encrypted = zip.isEncrypted();
+                encryptionChecks.put(key, new Fallback(current, encrypted));
+                while (encryptionChecks.size() > CACHE_LIMIT) encryptionChecks.remove(encryptionChecks.keySet().iterator().next());
+                return encrypted;
+            }
+        }
         catch (Exception ignored) { return false; }
     }
     private static void cachePassword(File archive, char[] password) {
@@ -117,6 +127,7 @@ final class ArchiveOps {
     private record Folders(Stamp stamp, Map<String, List<Item>> lists) {}
     private record Fallback(Stamp stamp, boolean encrypted) {}
     private static final Map<String, Fallback> fallbacks = new LinkedHashMap<>(8, .75f, true);
+    private static final Map<String, Fallback> encryptionChecks = new LinkedHashMap<>(8, .75f, true);
     private static final Map<String, Folders> folderCache = new LinkedHashMap<>(8, .75f, true);
     private interface Lister { List<Item> list() throws IOException; }
     private static void rememberFallback(String key, Stamp stamp, boolean encrypted) {
@@ -163,7 +174,7 @@ final class ArchiveOps {
     static synchronized void forget(File archive) {
         try {
             String key = archive.getCanonicalPath();
-            indexes.remove(key); indexItems.remove(key); folderCache.remove(key); fallbacks.remove(key);
+            indexes.remove(key); indexItems.remove(key); folderCache.remove(key); fallbacks.remove(key); encryptionChecks.remove(key);
         } catch (IOException ignored) { }
     }
     private static List<Item> listZip4j(File file, String prefix) throws IOException {
@@ -427,6 +438,7 @@ final class ArchiveOps {
     }
     private static void rewrite(File archive, String remove, String rename, Map<String, File> additions,
                                 Set<String> removals) throws IOException {
+        Tasks.Progress.check();
         FileStore.FileState before = FileStore.FileState.read(archive);
         if (isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive))
             throw new IOException("此归档格式暂不支持直接修改，请先解压后编辑");
@@ -440,6 +452,7 @@ final class ArchiveOps {
                 Enumeration<? extends ZipEntry> entries = zip.entries();
                 while (entries.hasMoreElements()) {
                     ZipEntry e = entries.nextElement(); String name = e.getName();
+                    Tasks.Progress.check();
                     if (removals.contains(name) || removedParent(name, removals)) continue;
                     boolean removed = remove != null && (name.equals(remove) || (remove.endsWith("/") && name.startsWith(remove)));
                     if (apk && isSignature(name)) continue;
@@ -458,6 +471,7 @@ final class ArchiveOps {
                     out.closeEntry();
                 }
                 for (Map.Entry<String, File> added : additions.entrySet()) {
+                    Tasks.Progress.check();
                     if (!written.add(added.getKey())) throw new IOException("条目冲突");
                     out.putNextEntry(new ZipEntry(added.getKey()));
                     if (added.getValue() != null)
@@ -465,6 +479,7 @@ final class ArchiveOps {
                     out.closeEntry();
                 }
             }
+            Tasks.Progress.check();
             FileStore.publish(tmp, archive, before);
             forget(archive);
         } finally { Files.deleteIfExists(tmp.toPath()); }

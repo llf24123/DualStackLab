@@ -170,11 +170,10 @@ final class DirectorySheet {
     private void settle(boolean open) {
         body.animate().cancel(); scrim.animate().cancel();
         settling = open;
-        body.animate().translationY(open ? 0 : dialogHeight).setDuration(open ? 180 : 150)
-                .setInterpolator(open ? new android.view.animation.DecelerateInterpolator()
-                        : new android.view.animation.AccelerateInterpolator())
+        body.animate().translationY(open ? 0 : dialogHeight).setDuration(Ui.motionEnabled() ? Ui.MOTION_PANEL : 0)
+                .setInterpolator(Ui.EASING)
                 .withEndAction(() -> { settling = null; if (!open) dismiss(); }).start();
-        scrim.animate().alpha(open ? 1 : 0).setDuration(open ? 180 : 150).start();
+        scrim.animate().alpha(open ? 1 : 0).setDuration(Ui.motionEnabled() ? Ui.MOTION_PANEL : 0).setInterpolator(Ui.EASING).start();
     }
     void dismiss() {
         settling = null;
@@ -266,6 +265,7 @@ final class DirectorySheet {
         SwipeLayout(android.content.Context context, boolean upward, Runnable action) {
             super(context); this.upward = upward; this.action = action;
             setClickable(true);
+            setFocusable(true); setOnClickListener(v -> action.run());
             slop = ViewConfiguration.get(context).getScaledTouchSlop();
         }
         void setDragCallbacks(Runnable start, Consumer<Float> progress, Consumer<Boolean> end) {
@@ -302,7 +302,13 @@ final class DirectorySheet {
                 else setTranslationY((upward ? -1 : 1) * distance);
                 return true;
             }
-            if (!swiping) return super.onTouchEvent(event);
+            if (!swiping) {
+                if (type == MotionEvent.ACTION_UP) {
+                    if (Math.abs(event.getRawX() - x) <= slop && Math.abs(event.getRawY() - y) <= slop) performClick();
+                    return true;
+                }
+                return super.onTouchEvent(event);
+            }
             if (type == MotionEvent.ACTION_UP || type == MotionEvent.ACTION_CANCEL || type == MotionEvent.ACTION_POINTER_DOWN) {
                 float distance = Math.max(0, upward ? y - event.getRawY() : event.getRawY() - y);
                 boolean commit = type == MotionEvent.ACTION_UP && distance >= Ui.dp(getContext(), 48);
@@ -310,10 +316,11 @@ final class DirectorySheet {
                 getParent().requestDisallowInterceptTouchEvent(false);
                 if (dragEnd != null) dragEnd.accept(commit);
                 else if (commit) action.run();
-                else animate().translationY(0).setDuration(150).start();
+                else animate().translationY(0).setDuration(Ui.motionEnabled() ? Ui.MOTION_PANEL : 0).setInterpolator(Ui.EASING).start();
             }
             return true;
         }
+        @Override public boolean performClick() { super.performClick(); return true; }
     }
 
 }

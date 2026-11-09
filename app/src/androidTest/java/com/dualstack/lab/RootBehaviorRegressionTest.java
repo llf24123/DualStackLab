@@ -30,7 +30,7 @@ public class RootBehaviorRegressionTest {
         Files.write(target.toPath(), "original".getBytes(StandardCharsets.UTF_8));
         Files.write(adjacent.toPath(), "keep".getBytes(StandardCharsets.UTF_8));
         Process process = new ProcessBuilder("/system/bin/sh", "-c",
-                FileStore.rootWriteCommand(target.getPath(), temporary.getPath(), 100)).start();
+                FileStore.rootWriteCommand(context.getApplicationInfo().sourceDir, target.getPath(), temporary.getPath(), 100, null)).start();
         try (OutputStream output = process.getOutputStream()) { output.write(new byte[]{1, 2, 3}); }
         assertTrue(process.waitFor(10, TimeUnit.SECONDS)); assertNotEquals(0, process.exitValue());
         assertEquals("original", new String(Files.readAllBytes(target.toPath()), StandardCharsets.UTF_8));

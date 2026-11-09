@@ -39,15 +39,15 @@ public class ShellActivity extends LabActivity {
             if (runner != null || outputLog == null) { Tasks.toast(this, "命令结束后可打开输出日志"); return; }
             android.content.Intent intent = new android.content.Intent(this, EditorActivity.class);
             FileStore.local(outputLog).put(intent); startActivity(intent);
-        }), lp(44, 52));
+        }), lp(48, 52));
         top.addView(Ui.icon(this, R.drawable.ic_trash, "清空输出", Color.WHITE, () -> output.setText("")),
-                lp(44, 52));
+                lp(48, 52));
         body.addView(top, lp(-1, 52));
         LinearLayout location = Ui.row(this);
         directory = Ui.input(this, "工作目录");
         String cwd = getIntent().getStringExtra("cwd");
         directory.setText(cwd == null ? getFilesDir().getAbsolutePath() : cwd);
-        location.addView(directory, new LinearLayout.LayoutParams(0, Ui.dp(this, 46), 1));
+        location.addView(directory, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
         rootMode = new CheckBox(this); rootMode.setText("ROOT");
         rootMode.setTextSize(14);
         rootMode.setPadding(Ui.dp(this, 4), 0, Ui.dp(this, 8), 0);
@@ -60,7 +60,7 @@ public class ShellActivity extends LabActivity {
             generatedCommand = script.command(checked, pipeMode);
             command.setText(generatedCommand + suffix);
         });
-        location.addView(rootMode, lp(88, 46)); body.addView(location);
+        location.addView(rootMode, lp(88, 48)); body.addView(location);
         command = Ui.input(this, "Shell 命令"); command.setSingleLine(false); command.setMaxLines(4);
         command.setTypeface(Typeface.MONOSPACE); command.setText("pwd");
         command.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -69,7 +69,7 @@ public class ShellActivity extends LabActivity {
         LinearLayout controls = Ui.row(this);
         execute = Ui.icon(this, R.drawable.ic_play, "执行", Ui.ACCENT, this::execute);
         stop = Ui.icon(this, R.drawable.ic_stop, "停止", Ui.TEXT, this::stop);
-        controls.addView(execute, lp(48, 44)); controls.addView(stop, lp(48, 44));
+        controls.addView(execute, lp(48, 48)); controls.addView(stop, lp(48, 48));
         status = Ui.single(this, "准备就绪", 11, Ui.MUTED);
         controls.addView(status, new LinearLayout.LayoutParams(0, Ui.dp(this, 44), 1)); body.addView(controls);
         body.addView(Ui.line(this));
@@ -80,7 +80,7 @@ public class ShellActivity extends LabActivity {
         scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.addView(output);
         body.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1)); body.addView(Ui.line(this));
         LinearLayout stdin = Ui.row(this);
-        input = Ui.input(this, "标准输入"); stdin.addView(input, new LinearLayout.LayoutParams(0, Ui.dp(this, 46), 1));
+        input = Ui.input(this, "标准输入"); stdin.addView(input, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
         send = Ui.icon(this, R.drawable.ic_send, "发送输入", Ui.ACCENT, this::sendInput);
         eof = Ui.icon(this, R.drawable.ic_check, "结束输入", Ui.TEXT, () -> {
             ShellRunner running = runner;
@@ -88,7 +88,7 @@ public class ShellActivity extends LabActivity {
                 try { running.closeInput(); } catch (IOException e) { runOnUiThread(() -> Tasks.toast(this, e.getMessage())); }
             });
         });
-        stdin.addView(send, lp(46, 46)); stdin.addView(eof, lp(46, 46)); body.addView(stdin);
+        stdin.addView(send, lp(48, 48)); stdin.addView(eof, lp(48, 48)); body.addView(stdin);
         Ui.install(this, body);
         if (saved != null) {
             directory.setText(saved.getString("cwd")); command.setText(saved.getString("command"));

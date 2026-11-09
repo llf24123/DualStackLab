@@ -92,8 +92,8 @@ final class SwipeSelectListView extends ListView {
         cancelRebound();
         if (refresh && selection != null) selection.refresh();
         rebound = ValueAnimator.ofFloat(released, 0f);
-        rebound.setDuration(420);
-        rebound.setInterpolator(new OvershootInterpolator(refresh ? .9f : 1.5f));
+        rebound.setDuration(Ui.motionEnabled() ? Ui.MOTION_PANEL : 0);
+        rebound.setInterpolator(Ui.EASING);
         rebound.addUpdateListener(value -> offset((float) value.getAnimatedValue()));
         rebound.start();
     }

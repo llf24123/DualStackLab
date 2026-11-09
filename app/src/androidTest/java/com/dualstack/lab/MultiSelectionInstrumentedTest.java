@@ -43,6 +43,7 @@ public class MultiSelectionInstrumentedTest {
         File folder = new File(left, "folder"); assertTrue(folder.mkdir()); assertTrue(folder.setLastModified(stamp("2024-02-29T10:00")));
         preferences.edit().clear().putString("left", left.getPath()).putString("right", right.getPath()).putBoolean("showHidden", false).commit();
         scenario = ActivityScenario.launch(MainActivity.class);
+        scenario.onActivity(activity -> activity.setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT));
         pane(true).findObject(By.text("a.txt"));
         assertNotNull(device.wait(Until.findObject(By.text("e.txt")), 10000));
     }

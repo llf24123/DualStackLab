@@ -21,6 +21,10 @@ public class ArchiveActivity extends LabActivity {
     private FileStore store;
     private FileStore.Node source;
     private File archive, pendingOutput;
+    // A revision belongs to the bytes in archive, never to a later observation of source.
+    private final Object workspaceLock = new Object();
+    private String sourceRevision;
+    private record ClassPreview(File file, String revision, String archivePath) {}
     private String prefix = "", replacement, dexEntry;
     private TextView path, summary;
     private ListView list;
@@ -36,18 +40,18 @@ public class ArchiveActivity extends LabActivity {
         store = new FileStore(this); LinearLayout root = Ui.column(this);
         LinearLayout top = Ui.toolbar(this, getIntent().getStringExtra("name"), this::finish);
         View toolButton = Ui.icon(this, R.drawable.ic_more, "APK 工具", Color.WHITE, this::toolMenu);
-        top.addView(toolButton, lp(46, 52));
+        top.addView(toolButton, lp(48, 52));
         root.addView(top, lp(-1, 52));
         LinearLayout tabs = Ui.row(this); tabs.setBackgroundColor(Ui.PANEL);
         TextView files = tab("归档", () -> { if (!rawDex) { browser.setVisibility(View.VISIBLE); tools.setVisibility(View.GONE); } });
         TextView apk = tab("APK 工具", () -> { browser.setVisibility(View.GONE); tools.setVisibility(View.VISIBLE); });
-        tabs.addView(files, new LinearLayout.LayoutParams(0, dp(42), 1));
-        tabs.addView(apk, new LinearLayout.LayoutParams(0, dp(42), 1));
+        tabs.addView(files, new LinearLayout.LayoutParams(0, dp(48), 1));
+        tabs.addView(apk, new LinearLayout.LayoutParams(0, dp(48), 1));
         root.addView(tabs); root.addView(Ui.line(this));
         browser = Ui.column(this); browser.setBackgroundColor(Ui.SURFACE);
         LinearLayout location = Ui.row(this); location.setPadding(dp(10), 0, dp(8), 0);
-        location.addView(Ui.icon(this, R.drawable.ic_up, "上级目录", Ui.ACCENT, this::up), lp(42, 42));
-        path = Ui.single(this, "/", 12, Ui.TEXT); location.addView(path, new LinearLayout.LayoutParams(0, dp(42), 1));
+        location.addView(Ui.icon(this, R.drawable.ic_up, "上级目录", Ui.ACCENT, this::up), lp(48, 48));
+        path = Ui.single(this, "/", 12, Ui.TEXT); location.addView(path, new LinearLayout.LayoutParams(0, dp(48), 1));
         browser.addView(location); browser.addView(Ui.line(this));
         list = new ListView(this); list.setDivider(null);
         adapter = new BaseAdapter() {
@@ -105,19 +109,27 @@ public class ArchiveActivity extends LabActivity {
         Ui.install(this, root);
         Tasks.run(this, () -> {
             source = store.fromIntent(getIntent()); rawDex = source.name.toLowerCase(Locale.ROOT).endsWith(".dex");
-            if (source.name.toLowerCase(Locale.ROOT).endsWith(".arsc")) return null;
+            if (source.name.toLowerCase(Locale.ROOT).endsWith(".arsc")) {
+                synchronized (workspaceLock) { sourceRevision = store.fingerprint(source); }
+                return null;
+            }
             File dir = Files.createTempDirectory(getCacheDir().toPath(), "archive-").toFile();
-            File original = store.materialize(source);
             File copy = new File(dir, source.name.replace('/', '_'));
-            Files.copy(original.toPath(), copy.toPath());
-            store.release(source, original);
+            synchronized (workspaceLock) {
+                try {
+                    sourceRevision = copySource(copy, false, "");
+                    archive = copy;
+                } catch (Exception error) {
+                    Files.deleteIfExists(copy.toPath()); Files.deleteIfExists(dir.toPath()); throw error;
+                }
+            }
             return copy;
         }, copy -> {
             if (copy == null) {
                 Intent i = new Intent(this, EditorActivity.class); source.put(i); i.putExtra("mode", "arsc-file");
+                i.putExtra("sourceRevision", sourceRevision);
                 startActivity(i); finish(); return;
             }
-            archive = copy;
             rar = ArchiveOps.isRar(copy) || ArchiveFormats.supported(copy);
             if (rar) {
                 apk.setVisibility(View.GONE); toolButton.setVisibility(View.GONE);
@@ -155,28 +167,47 @@ public class ArchiveActivity extends LabActivity {
     private void command(LinearLayout bar, int icon, String text, Runnable task) {
         bar.addView(Ui.command(this, icon, text, task), new LinearLayout.LayoutParams(0, -1, 1));
     }
+    /** Caller holds workspaceLock; publish only bytes observed under one stable source revision. */
+    private String copySource(File destination, boolean validate, String current) throws IOException {
+        File staged = File.createTempFile("source-", "-" + destination.getName(), destination.getParentFile());
+        try {
+            String before = store.fingerprint(source);
+            try (InputStream input = store.read(source); OutputStream output = new FileOutputStream(staged)) {
+                FileStore.pump(input, output);
+            }
+            if (source.file != null) ArchiveOps.copyPassword(source.file, staged);
+            if (validate && !rawDex) ArchiveOps.list(staged, current);
+            if (!before.equals(store.fingerprint(source))) throw revisionConflict();
+            FileStore.replace(staged, destination);
+            ArchiveOps.forget(destination);
+            if (source.file != null) ArchiveOps.copyPassword(source.file, destination);
+            return before;
+        } finally {
+            ArchiveOps.clearPassword(staged); ArchiveOps.forget(staged);
+            Files.deleteIfExists(staged.toPath());
+        }
+    }
+    private IOException revisionConflict() {
+        return new IOException("原文件已变化或工作副本已失效，请刷新或重新打开后再修改；旧工作区不会自动合并");
+    }
+    private void requireRevision() throws IOException {
+        if (sourceRevision == null || !sourceRevision.equals(store.fingerprint(source))) throw revisionConflict();
+    }
     private void reload() {
         reload(false);
     }
     private void reload(boolean readSource) {
-        if (archive == null || rawDex) { if (refresh != null) refresh.setRefreshing(false); return; }
+        if (archive == null || (rawDex && !readSource)) { if (refresh != null) refresh.setRefreshing(false); return; }
         if (readSource && busy) { refresh.setRefreshing(false); return; }
         int token = ++reloadGeneration;
         long started = SystemClock.uptimeMillis();
         if (readSource) refresh.setRefreshing(true);
         String current = prefix;
         Tasks.run(this, () -> {
-            if (readSource) {
-                File copy = File.createTempFile("refresh-", rar ? ".rar" : ".zip", archive.getParentFile());
-                try {
-                    try (InputStream input = store.read(source); OutputStream output = new FileOutputStream(copy)) {
-                        FileStore.pump(input, output);
-                    }
-                    ArchiveOps.list(copy, current);
-                    FileStore.replace(copy, archive);
-                } finally { Files.deleteIfExists(copy.toPath()); }
+            synchronized (workspaceLock) {
+                if (readSource) sourceRevision = copySource(archive, true, current);
+                return rawDex ? Collections.<ArchiveOps.Item>emptyList() : ArchiveOps.list(archive, current);
             }
-            return ArchiveOps.list(archive, current);
         }, found -> {
             if (token != reloadGeneration || !current.equals(prefix)) return;
             if (readSource) {
@@ -207,22 +238,39 @@ public class ArchiveActivity extends LabActivity {
                 Intent preview = new Intent(this, PreviewActivity.class); entry.put(preview);
                 preview.putExtra("kind", kind); startActivity(preview); return;
             }
-            Intent editor = new Intent(this, EditorActivity.class); entry.put(editor);
-            editor.putExtra("displayName", item.path()).putExtra("readOnly", true); startActivity(editor); return;
+            Tasks.run(this, () -> {
+                synchronized (workspaceLock) {
+                    if (sourceRevision == null) throw revisionConflict();
+                    Intent editor = new Intent(this, EditorActivity.class); entry.put(editor);
+                    return editor.putExtra("displayName", item.path()).putExtra("readOnly", true)
+                            .putExtra("sourceRevision", sourceRevision);
+                }
+            }, this::startActivity); return;
         }
         String name = item.name().toLowerCase(Locale.ROOT);
         if (name.endsWith(".dex")) { dexEntry = item.path(); dexBrowser(item.path()); return; }
         if (name.equals("resources.arsc")) { edit(item.path(), "arsc"); return; }
         if (name.endsWith(".xml")) {
-            Tasks.run(this, () -> ResXmlDocument.isResXmlBlock(ArchiveOps.bytes(archive, item.path(), EditorActivity.LIMIT)),
-                    binary -> edit(item.path(), binary ? "xml" : null)); return;
+            Tasks.run(this, () -> {
+                synchronized (workspaceLock) {
+                    boolean binary = ResXmlDocument.isResXmlBlock(ArchiveOps.bytes(archive, item.path(), EditorActivity.LIMIT));
+                    return editorIntent(item.path(), binary ? "xml" : null);
+                }
+            }, this::startActivity); return;
         }
         edit(item.path(), null);
     }
-    private void edit(String entry, String mode) {
+    /** Caller holds workspaceLock so intent metadata describes the selected workspace. */
+    private Intent editorIntent(String entry, String mode) throws IOException {
+        if (sourceRevision == null) throw revisionConflict();
         Intent i = new Intent(this, EditorActivity.class); source.put(i);
-        i.putExtra("archivePath", archive.getAbsolutePath()).putExtra("archiveEntry", entry)
-                .putExtra("displayName", entry).putExtra("mode", mode); startActivity(i);
+        return i.putExtra("archivePath", archive.getAbsolutePath()).putExtra("archiveEntry", entry)
+                .putExtra("displayName", entry).putExtra("mode", mode).putExtra("sourceRevision", sourceRevision);
+    }
+    private void edit(String entry, String mode) {
+        Tasks.run(this, () -> {
+            synchronized (workspaceLock) { return editorIntent(entry, mode); }
+        }, this::startActivity);
     }
     private void itemMenu(ArchiveOps.Item item) {
         String[] options = rar ? new String[]{"打开", "解压此项"}
@@ -237,9 +285,15 @@ public class ArchiveActivity extends LabActivity {
                         }
                         case 3 -> rename(item);
                         case 4 -> new AlertDialog.Builder(this).setTitle("删除 " + item.name() + "？")
-                                .setNegativeButton("取消", null).setPositiveButton("删除", (x, w) -> change(() -> {
-                                    ArchiveOps.rewrite(archive, item.path(), null, Collections.emptyMap()); return true;
-                                })).show();
+                                .setMessage("删除前会生成可恢复备份，任务进度可在任务中心查看。")
+                                .setNegativeButton("取消", null).setPositiveButton("删除", (x, w) -> {
+                                    if (rar || busy) return;
+                                    FileStore.Node node = FileStore.archiveNode(source, item.path(), item.directory(), item.size(), item.modified());
+                                    Operations.Spec spec = Operations.Spec.of(Operations.DELETE, List.of(node), store.parent(node), null);
+                                    spec.sourceRevision = sourceRevision;
+                                    try { Operations.get(this).enqueue(spec); startActivity(new Intent(this, TaskCenterActivity.class)); }
+                                    catch (Exception error) { Tasks.showError(this, error); }
+                                }).show();
                     }
                 }).show();
     }
@@ -311,10 +365,36 @@ public class ArchiveActivity extends LabActivity {
         if (rar) { Tasks.toast(this, "此归档格式当前为只读浏览"); return; }
         if (busy) { Tasks.toast(this, "请等待当前操作"); return; }
         busy = true; refresh.setEnabled(false); summary.setText("处理并写回中…");
-        Tasks.run(this, () -> {
-            try { T result = job.run(); store.write(source, archive); return result; }
-            finally { runOnUiThread(() -> { busy = false; refresh.setEnabled(true); reload(); }); }
-        }, result -> { reload(); Tasks.toast(this, "已写回原文件"); });
+        Tasks.run(this, () -> applyChange(job), result -> {
+            finishChange(); Tasks.toast(this, "已写回原文件");
+        }, error -> { finishChange(); Tasks.showError(this, error); });
+    }
+    private void finishChange() {
+        busy = false; refresh.setEnabled(true); reload();
+    }
+    private <T> T applyChange(Tasks.Job<T> job) throws Exception {
+        synchronized (workspaceLock) {
+            requireRevision();
+            String expected = sourceRevision;
+            File backup = File.createTempFile("before-change-", ".bak", archive.getParentFile());
+            try {
+                Files.copy(archive.toPath(), backup.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                try {
+                    T result = job.run();
+                    store.write(source, archive, expected);
+                    // A post-write fingerprint alone could attach an external update to our old bytes.
+                    // Re-copy a stable source snapshot instead, before publishing its matching baseline.
+                    sourceRevision = copySource(archive, true, prefix);
+                    return result;
+                } catch (Exception error) {
+                    try {
+                        FileStore.replace(backup, archive); ArchiveOps.forget(archive);
+                        sourceRevision = expected;
+                    } catch (IOException rollback) { sourceRevision = null; error.addSuppressed(rollback); }
+                    throw error;
+                }
+            } finally { Files.deleteIfExists(backup.toPath()); }
+        }
     }
     private File outputDir() throws IOException {
         File base = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager() ?
@@ -399,18 +479,50 @@ public class ArchiveActivity extends LabActivity {
         File dir = new File(outputDir(), source.name + "-" + (entry.isEmpty() ? "dex" : entry.replace('/', '_')) + "-" + hash);
         projects.put(entry, dir); return dir;
     }
+    private File projectRevisionFile(File project) {
+        return new File(project.getParentFile(), project.getName() + ".source-revision");
+    }
+    private void recordProjectRevision(File project) throws IOException {
+        File revision = projectRevisionFile(project);
+        File staged = File.createTempFile("project-revision-", ".tmp", revision.getParentFile());
+        try {
+            Files.write(staged.toPath(), sourceRevision.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            FileStore.replace(staged, revision);
+        } finally { Files.deleteIfExists(staged.toPath()); }
+    }
+    private File verifiedProject(String entry) throws Exception {
+        File project = project(entry), revision = projectRevisionFile(project);
+        if (!revision.isFile() || sourceRevision == null || !sourceRevision.equals(
+                new String(Files.readAllBytes(revision.toPath()), java.nio.charset.StandardCharsets.UTF_8)))
+            throw new IOException("反汇编工作区来自旧版本或缺少来源版本，请刷新/重开并在新工作区反汇编；已有 project 已保留：" + project);
+        return project;
+    }
     private void disassemble(String entry) {
         busy = true; summary.setText("DEX 反汇编中…");
         Tasks.run(this, () -> {
-            try { File out = project(entry); ApkTools.disassemble(dexFile(entry), out); return out; }
-            finally { runOnUiThread(() -> busy = false); }
+            try {
+                synchronized (workspaceLock) {
+                    requireRevision();
+                    File out = project(entry);
+                    if (out.exists()) {
+                        String[] children = out.list();
+                        if (children == null || children.length != 0) {
+                            // Explicit re-disassembly gets a fresh directory, never erases a user's project.
+                            out = Files.createTempDirectory(out.getParentFile().toPath(), out.getName() + "-").toFile();
+                            projects.put(entry, out);
+                        }
+                    }
+                    ApkTools.disassemble(dexFile(entry), out);
+                    recordProjectRevision(out); return out;
+                }
+            } finally { runOnUiThread(() -> busy = false); }
         }, this::showOutput);
     }
     private void assemble(String entry) {
         new AlertDialog.Builder(this).setTitle("回编译并写回 DEX？").setMessage(entry.isEmpty() ? source.name : entry)
                 .setNegativeButton("取消", null).setPositiveButton("编译", (d, w) -> change(() -> {
                     File out = new File(archive.getParentFile(), "compiled.dex");
-                    ApkTools.assemble(project(entry), out);
+                    ApkTools.assemble(verifiedProject(entry), out);
                     if (rawDex) FileStore.replace(out, archive);
                     else ArchiveOps.rewrite(archive, null, null, Map.of(entry, out));
                     return true;
@@ -418,9 +530,11 @@ public class ArchiveActivity extends LabActivity {
     }
     private void dexBrowser(String entry) {
         Tasks.run(this, () -> {
-            List<String> names = new ArrayList<>();
-            for (ClassDef def : DexFileFactory.loadDexFile(dexFile(entry), Opcodes.getDefault()).getClasses()) names.add(def.getType());
-            Collections.sort(names); return names;
+            synchronized (workspaceLock) {
+                List<String> names = new ArrayList<>();
+                for (ClassDef def : DexFileFactory.loadDexFile(dexFile(entry), Opcodes.getDefault()).getClasses()) names.add(def.getType());
+                Collections.sort(names); return names;
+            }
         }, names -> {
             LinearLayout body = Ui.column(this); EditText find = Ui.input(this, "类名过滤"); body.addView(find);
             ListView classes = new ListView(this); body.addView(classes, lp(-1, 420));
@@ -434,23 +548,30 @@ public class ArchiveActivity extends LabActivity {
                     .setView(body).setNegativeButton("关闭", null).setPositiveButton("反汇编到工作区", (d, w) -> disassemble(entry)).create();
             classes.setOnItemClickListener((p, v, pos, id) -> {
                 String descriptor = adapter.getItem(pos);
-                Tasks.run(this, () -> {
-                    File dex = dexFile(entry), folder = Files.createTempDirectory(getCacheDir().toPath(), "class-").toFile();
-                    BaksmaliOptions options = new BaksmaliOptions(); options.apiLevel = 28; options.debugInfo = true;
-                    if (!Baksmali.disassembleDexFile(DexFileFactory.loadDexFile(dex, Opcodes.getDefault()),
-                            folder, 1, options, List.of(descriptor))) throw new IOException("类反汇编失败");
-                    List<File> smali = new ArrayList<>(); collectSmali(folder, smali);
-                    if (smali.isEmpty()) throw new IOException("未输出 Smali");
-                    return smali.get(0);
-                }, file -> {
-                    Intent i = new Intent(this, EditorActivity.class); source.put(i);
-                    i.putExtra("preview", file.getAbsolutePath()).putExtra("displayName", descriptor)
-                            .putExtra("mode", "smali-class").putExtra("archivePath", archive.getAbsolutePath())
-                            .putExtra("dexEntry", entry).putExtra("descriptor", descriptor);
-                    startActivity(i);
-                });
+                Tasks.run(this, () -> classPreview(entry, descriptor), preview -> startActivity(
+                        classEditorIntent(entry, descriptor, preview)));
             }); dialog.show();
         });
+    }
+    private ClassPreview classPreview(String entry, String descriptor) throws Exception {
+        synchronized (workspaceLock) {
+            if (sourceRevision == null) throw revisionConflict();
+            String revision = sourceRevision, archivePath = archive.getAbsolutePath();
+            File dex = dexFile(entry), folder = Files.createTempDirectory(getCacheDir().toPath(), "class-").toFile();
+            BaksmaliOptions options = new BaksmaliOptions(); options.apiLevel = 28; options.debugInfo = true;
+            if (!Baksmali.disassembleDexFile(DexFileFactory.loadDexFile(dex, Opcodes.getDefault()),
+                    folder, 1, options, List.of(descriptor))) throw new IOException("类反汇编失败");
+            List<File> smali = new ArrayList<>(); collectSmali(folder, smali);
+            if (smali.isEmpty()) throw new IOException("未输出 Smali");
+            return new ClassPreview(smali.get(0), revision, archivePath);
+        }
+    }
+    private Intent classEditorIntent(String entry, String descriptor, ClassPreview preview) {
+        Intent i = new Intent(this, EditorActivity.class); source.put(i);
+        return i.putExtra("preview", preview.file().getAbsolutePath()).putExtra("displayName", descriptor)
+                .putExtra("mode", "smali-class").putExtra("archivePath", preview.archivePath())
+                .putExtra("dexEntry", entry).putExtra("descriptor", descriptor)
+                .putExtra("sourceRevision", preview.revision());
     }
     private void collectSmali(File dir, List<File> out) throws IOException {
         File[] children = dir.listFiles(); if (children == null) throw new IOException("工作区不可读取");

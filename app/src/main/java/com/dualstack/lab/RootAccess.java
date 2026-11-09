@@ -35,8 +35,7 @@ final class RootAccess {
     /** Filesystem directories open as ROOT by default; only unreadable paths stop the probe early. */
     static FileStore.Node directory(File path, boolean preferRoot) throws IOException {
         if (!preferRoot && !available()) {
-            if (StorageNavigation.storageContainer(path)) return FileStore.directory(path, false);
-            if (!restrictedStorage(path) && readable(path) && !available()) return FileStore.directory(path, false);
+            if (StorageNavigation.storageContainer(path) || readable(path)) return FileStore.directory(path, false);
         }
         try {
             if (SystemClock.elapsedRealtime() >= grantedUntil) {
@@ -78,8 +77,11 @@ final class RootAccess {
     }
 
     private static FileStore.Node elevated(FileStore.Node node) {
-        return new FileStore.Node(node.name, node.file, null, node.directory, true,
+        FileStore.Node elevated = new FileStore.Node(node.name, node.file, null, node.directory, true,
                 node.size, node.modified);
+        elevated.identity = node.identity; elevated.parentIdentity = node.parentIdentity;
+        elevated.directoryIdentity = node.directoryIdentity; elevated.identityFollowsLinks = node.identityFollowsLinks;
+        return elevated;
     }
 
     static boolean protectedStorageDirectory(File path) {

@@ -122,7 +122,7 @@ public class CoreInstrumentedTest {
         for (int i = 0; i < 300; i++) text(new File(directory, "file-" + i), "data");
         String batched = FileStore.rootListCommand(directory.getAbsolutePath());
         String original = "/system/bin/toybox find " + FileStore.quote(directory.getAbsolutePath())
-                + " -mindepth 1 -maxdepth 1 -exec /system/bin/toybox stat -L -c '%f|%s|%Y|%n' {} \\;";
+                + " -mindepth 1 -maxdepth 1 -exec /system/bin/toybox stat -L -c '%f|%s|%Y|%d|%i|%n' {} \\;";
         long begin = android.os.SystemClock.elapsedRealtime();
         String before = FileStore.shell(original, false);
         long baseline = android.os.SystemClock.elapsedRealtime() - begin;
@@ -633,7 +633,7 @@ public class CoreInstrumentedTest {
         FileStore.shell("chmod 640 " + FileStore.quote(target.getAbsolutePath()), false);
         String before = FileStore.shell("stat -c '%a:%u:%g' " + FileStore.quote(target.getAbsolutePath()), false);
         Process process = new ProcessBuilder("sh", "-c", FileStore.rootWriteCommand(
-                target.getAbsolutePath(), temporary.getAbsolutePath())).start();
+                context.getApplicationInfo().sourceDir, target.getAbsolutePath(), temporary.getAbsolutePath(), -1, null)).start();
         try (OutputStream output = process.getOutputStream()) { output.write("after".getBytes(StandardCharsets.UTF_8)); }
         assertTrue(process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)); assertEquals(0, process.exitValue());
         assertEquals("after", new String(Files.readAllBytes(target.toPath()), StandardCharsets.UTF_8));

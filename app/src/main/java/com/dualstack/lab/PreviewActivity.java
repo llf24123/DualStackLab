@@ -59,6 +59,16 @@ public class PreviewActivity extends LabActivity {
             bitmap = picture.bitmap; status.setText(picture.dimensions + " · " + FileStore.size(file.length()));
             ZoomImageView image = new ZoomImageView(this); image.setImageBitmap(bitmap);
             image.setContentDescription("图片预览"); body.addView(image, new LinearLayout.LayoutParams(-1, 0, 1));
+            LinearLayout controls = Ui.row(this);
+            String[] labels = {"缩小", "适屏", "放大"};
+            for (int i = 0; i < labels.length; i++) {
+                int action = i; TextView button = Ui.text(this, labels[i], 14, Ui.ACCENT);
+                button.setGravity(android.view.Gravity.CENTER); button.setBackground(Ui.ripple(Ui.PANEL)); button.setFocusable(true);
+                button.setContentDescription("图片" + labels[i]); button.setOnClickListener(v -> {
+                    if (action == 1) image.reset(); else image.zoom(action == 0 ? 1f / 1.5f : 1.5f, image.getWidth() / 2f, image.getHeight() / 2f);
+                }); controls.addView(button, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
+            }
+            body.addView(controls);
         }, error -> status.setText("无法预览：" + error.getMessage()));
     }
     private record Picture(Bitmap bitmap, String dimensions) {}

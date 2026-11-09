@@ -15,14 +15,39 @@ final class RootDirectoryReader {
     private static Session session;
     private static ScheduledFuture<?> idle;
 
+    record Listing(String identity, String output) {}
+    static Listing snapshot(String path) throws IOException {
+        String marker = "__DUALSTACK_PARENT_" + UUID.randomUUID() + "_";
+        String quoted = FileStore.quote(path), listing = FileStore.rootListCommand(path);
+        String command = "if [ -d " + quoted + " ]; then /system/bin/toybox stat -L -c '"
+                + marker + "%d:%i' -- " + quoted + " && " + listing + "; else " + listing + "; fi";
+        String output = query(command);
+        int newline = output.indexOf('\n');
+        if (newline < 0 || !output.startsWith(marker)) throw new IOException("ROOT 目录快照缺少身份信息");
+        String identity = output.substring(marker.length(), newline);
+        if (!identity.matches("[0-9]+:[0-9]+")) throw new IOException("ROOT 目录身份无效");
+        return new Listing(identity, output.substring(newline + 1));
+    }
     static String list(String path) throws IOException { return list(path, true); }
-    static synchronized String list(String path, boolean followLinks) throws IOException {
+    static String list(String path, boolean followLinks) throws IOException {
+        return query(FileStore.rootListCommand(path, followLinks));
+    }
+    static String stat(String path, String format, boolean followLinks) throws IOException {
+        return query("/system/bin/toybox stat " + (followLinks ? "-L " : "") + "-c "
+                + FileStore.quote(format) + " -- " + FileStore.quote(path)).trim();
+    }
+    static String inspect(String path) throws IOException {
+        String quoted = FileStore.quote(path);
+        return query("/system/bin/toybox stat -L -c 'F|%d|%i|%f|%s|%Y' -- " + quoted
+                + " 2>/dev/null || /system/bin/toybox stat -c 'L|%d|%i|%f|%s|%Y' -- " + quoted).trim();
+    }
+    private static synchronized String query(String command) throws IOException {
         if (idle != null) idle.cancel(false);
         if (session != null && (!session.process.isAlive()
                 || SystemClock.elapsedRealtime() - session.created >= 30000)) close();
         try {
             if (session == null) session = new Session();
-            return session.list(FileStore.rootListCommand(path, followLinks));
+            return session.list(command);
         } catch (IOException e) {
             close(); throw e;
         } finally {
@@ -43,7 +68,10 @@ final class RootDirectoryReader {
         final Thread reader;
 
         Session() throws IOException {
-            process = RootShell.command("exec /system/bin/sh").redirectErrorStream(true).start();
+            this(RootShell.command("exec /system/bin/sh"));
+        }
+        Session(ProcessBuilder command) throws IOException {
+            process = command.redirectErrorStream(true).start();
             input = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8));
             reader = new Thread(() -> {
                 try (BufferedReader output = new BufferedReader(

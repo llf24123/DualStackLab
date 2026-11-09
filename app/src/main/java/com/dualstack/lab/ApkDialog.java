@@ -25,6 +25,7 @@ final class ApkDialog {
         LinearLayout titles = Ui.column(activity);
         TextView name = Ui.text(activity, node.name, 23, Ui.TEXT);
         TextView version = Ui.text(activity, "读取中…", 14, Ui.MUTED);
+        name.setMinHeight(Ui.dp(activity, 48)); version.setMinHeight(Ui.dp(activity, 48));
         titles.addView(name); titles.addView(version);
         name.setOnLongClickListener(v -> { copy(activity, name.getText().toString()); return true; });
         version.setOnLongClickListener(v -> { copy(activity, version.getText().toString()); return true; });
@@ -116,10 +117,10 @@ final class ApkDialog {
     private static void field(Activity activity, LinearLayout parent, Map<String, TextView> fields, String key, String value, Runnable click) {
         LinearLayout row = Ui.row(activity);
         TextView label = Ui.single(activity, key, 14, Ui.TEXT);
-        row.addView(label, new LinearLayout.LayoutParams(Ui.dp(activity, 102), Ui.dp(activity, 28)));
+        row.addView(label, new LinearLayout.LayoutParams(Ui.dp(activity, 102), Ui.dp(activity, 48)));
         TextView text = Ui.single(activity, value, 13, Ui.MUTED); text.setEllipsize(TextUtils.TruncateAt.END);
         text.setContentDescription(key + " " + value); text.setTooltipText(value);
-        row.addView(text, new LinearLayout.LayoutParams(0, Ui.dp(activity, 28), 1));
+        row.addView(text, new LinearLayout.LayoutParams(0, Ui.dp(activity, 48), 1));
         text.setOnLongClickListener(v -> { copy(activity, text.getText().toString()); return true; });
         label.setOnLongClickListener(v -> { copy(activity, text.getText().toString()); return true; });
         if (click != null) row.setOnClickListener(v -> click.run());

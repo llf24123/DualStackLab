@@ -12,6 +12,8 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 final class FileStore {
     static final class Node {
@@ -22,6 +24,8 @@ final class FileStore {
         final long size, modified;
         final Node container;
         final String entry;
+        volatile String identity, parentIdentity, directoryIdentity;
+        boolean identityFollowsLinks = true;
         private String cachedKey;
         Node(String name, File file, Uri uri, boolean directory, boolean root, long size, long modified) {
             this(name, file, uri, directory, root, size, modified, null, null);
@@ -51,17 +55,37 @@ final class FileStore {
     FileStore(Context c) { context = c.getApplicationContext(); }
     static Node local(File f) { return local(f, false); }
     static Node local(File f, boolean root) {
+        Node node;
         try {
             java.nio.file.attribute.BasicFileAttributes attributes = Files.readAttributes(f.toPath(),
                     java.nio.file.attribute.BasicFileAttributes.class);
-            return new Node(f.getName().isEmpty() ? "/" : f.getName(), f, null, attributes.isDirectory(), root,
+            node = new Node(f.getName().isEmpty() ? "/" : f.getName(), f, null, attributes.isDirectory(), root,
                     attributes.size(), attributes.lastModifiedTime().toMillis());
-        } catch (IOException ignored) {}
-        return new Node(f.getName().isEmpty() ? "/" : f.getName(), f, null,
-                f.isDirectory(), root, f.length(), f.lastModified());
+        } catch (IOException ignored) {
+            node = new Node(f.getName().isEmpty() ? "/" : f.getName(), f, null,
+                    f.isDirectory(), root, f.length(), f.lastModified());
+        }
+        identifyLocal(node);
+        return node;
     }
+    private static void identifyLocal(Node node) {
+        try {
+            android.system.StructStat stat;
+            try { stat = android.system.Os.stat(node.path()); }
+            catch (android.system.ErrnoException unavailable) {
+                stat = android.system.Os.lstat(node.path()); node.identityFollowsLinks = false;
+            }
+            node.identity = fileIdentity(stat);
+            if (android.system.OsConstants.S_ISDIR(stat.st_mode)) node.directoryIdentity = node.identity;
+            File parent = node.file.getParentFile();
+            if (parent != null) node.parentIdentity = fileIdentity(android.system.Os.stat(parent.getAbsolutePath()));
+        } catch (android.system.ErrnoException ignored) { }
+    }
+    static String fileIdentity(android.system.StructStat stat) { return stat.st_dev + ":" + stat.st_ino; }
     static Node directory(File f, boolean root) {
-        return new Node(f.getName(), f, null, true, root, 0, 0);
+        Node node = new Node(f.getName(), f, null, true, root, 0, 0);
+        identifyLocal(node);
+        return node;
     }
     Node fromIntent(Intent i) throws IOException {
         if (i.hasExtra("archiveKey")) return fromKey(i.getStringExtra("archiveKey"));
@@ -93,7 +117,10 @@ final class FileStore {
             int slash = value.lastIndexOf('/');
             return archiveNode(node.container, slash < 0 ? "" : value.substring(0, slash + 1), true, 0, 0);
         }
-        return node.file != null && node.file.getParentFile() != null ? directory(node.file.getParentFile(), node.root) : null;
+        if (node.file == null || node.file.getParentFile() == null) return null;
+        Node parent = directory(node.file.getParentFile(), node.root);
+        if (node.parentIdentity != null) { parent.identity = node.parentIdentity; parent.directoryIdentity = node.parentIdentity; }
+        return parent;
     }
     Node document(Uri uri) throws IOException {
         try (Cursor c = context.getContentResolver().query(uri, null, null, null, null)) {
@@ -135,7 +162,15 @@ final class FileStore {
                         false, c.isNull(3) ? 0 : c.getLong(3), c.isNull(4) ? 0 : c.getLong(4)));
             } catch (Exception e) { throw new IOException("目录读取失败：" + e.getMessage(), e); }
         } else if (parent.root) {
-            out.addAll(parseRootListing(RootDirectoryReader.list(parent.path())));
+            RootDirectoryReader.Listing snapshot = RootDirectoryReader.snapshot(parent.path());
+            parent.directoryIdentity = snapshot.identity();
+            for (Node child : parseRootListing(snapshot.output())) {
+                if (!child.file.getAbsoluteFile().getParentFile().toPath().normalize().equals(
+                        parent.file.getAbsoluteFile().toPath().normalize()))
+                    throw new IOException("ROOT 目录条目超出当前目录，请检查文件名");
+                child.parentIdentity = snapshot.identity();
+                out.add(child);
+            }
         } else {
             File[] files = parent.file.listFiles();
             if (files == null) {
@@ -148,10 +183,10 @@ final class FileStore {
     }
     static String rootListCommand(String path) { return rootListCommand(path, true); }
     static String rootListCommand(String path, boolean followLinks) {
-        String stat = "/system/bin/toybox stat " + (followLinks ? "-L " : "") + "-c '%f|%s|%Y|%n' \"$@\"";
+        String stat = "/system/bin/toybox stat " + (followLinks ? "-L " : "") + "-c '%f|%s|%Y|%d|%i|%n' \"$@\"";
         String batch = followLinks ? "if ! " + stat + " 2>/dev/null; then "
                 + "for entry do if [ -L \"$entry\" ] && [ ! -e \"$entry\" ]; then "
-                + "/system/bin/toybox stat -c '%f|%s|%Y|%n' \"$entry\" 2>/dev/null; fi; done; fi; exit 0" : stat;
+                + "/system/bin/toybox stat -c '%f|%s|%Y|%d|%i|%n' \"$entry\" 2>/dev/null; fi; done; fi; exit 0" : stat;
         String quoted = quote(path);
         // Do not exit the persistent reader shell on a bad path, and never interpolate a path into shell code.
         return "if [ -d " + quoted + " ]; then /system/bin/toybox find -H " + quoted
@@ -172,19 +207,26 @@ final class FileStore {
     private static List<Node> parseRootListing(String output, boolean skipLinks) throws IOException {
         List<Node> out = new ArrayList<>();
         for (String line : output.split("\n")) {
-            String[] fields = line.split("\\|", 4);
-            if (fields.length != 4) continue;
+            String[] fields = line.split("\\|", 6);
+            if (fields.length != 6) continue;
             try {
                 int mode = Integer.parseInt(fields[0], 16);
                 if (skipLinks && (mode & 0xf000) == 0xa000) continue;
-                File f = new File(fields[3]);
-                out.add(new Node(f.getName(), f, null, (mode & 0xf000) == 0x4000,
-                        true, Long.parseLong(fields[1]), Long.parseLong(fields[2]) * 1000));
+                File f = new File(fields[5]);
+                Node node = new Node(f.getName(), f, null, (mode & 0xf000) == 0x4000,
+                        true, Long.parseLong(fields[1]), Long.parseLong(fields[2]) * 1000);
+                node.identity = Long.parseLong(fields[3]) + ":" + Long.parseLong(fields[4]);
+                node.identityFollowsLinks = (mode & 0xf000) != 0xa000;
+                if (node.directory) node.directoryIdentity = node.identity;
+                out.add(node);
             } catch (NumberFormatException e) { throw new IOException("ROOT 目录解析失败", e); }
         }
         return out;
     }
     InputStream read(Node requested) throws IOException {
+        return read(requested, null);
+    }
+    private InputStream read(Node requested, String rootIdentity) throws IOException {
         Node node = RootAccess.automatic(requested);
         if (node.container != null) {
             File archive = archiveView(node.container);
@@ -204,6 +246,19 @@ final class FileStore {
             return in;
         }
         if (!node.root) return new BufferedInputStream(new FileInputStream(node.file));
+        // A readable app-side descriptor is usable only when it names the same inode in ROOT's view.
+        // Keep ROOT-only and mount-namespace-specific files on the ROOT stream path.
+        try {
+            FileInputStream local = new FileInputStream(node.file);
+            try {
+                String expected = rootIdentity == null ? identity(node) : rootIdentity;
+                if (statIdentity(android.system.Os.fstat(local.getFD())).equals(expected))
+                    return new BufferedInputStream(local);
+            } catch (android.system.ErrnoException | IOException error) {
+                local.close(); throw error;
+            }
+            local.close();
+        } catch (android.system.ErrnoException | IOException unavailable) { }
         Process p = RootShell.command("cat " + quote(node.path())).start();
         return new FilterInputStream(p.getInputStream()) {
             @Override public void close() throws IOException {
@@ -223,30 +278,85 @@ final class FileStore {
             String path = quote(node.path());
             shell("if [ -L " + path + " ]; then printf '%s\\n' '不能直接保存符号链接，请打开真实文件' >&2; exit 1; fi; "
                     + "test -f " + path, true);
-        } else FileState.read(node.file);
+        } else FileState.metadata(node.file);
     }
-    void write(Node node, File content) throws IOException {
+    String fingerprint(Node requested) throws IOException {
+        Node node = requested;
+        while (node.container != null) node = node.container;
+        node = RootAccess.automatic(node);
+        String before = identity(node);
+        String digest;
+        try (InputStream input = node.file != null && !node.root
+                ? new FileInputStream(node.file) : read(node, before)) { digest = digest(input); }
+        if (!before.equals(identity(node))) throw new IOException("读取期间原文件已变化，请重新打开");
+        return before + ":" + digest;
+    }
+    String identity(Node node) throws IOException {
+        if (node.file != null) {
+            if (!node.root) {
+                try { return statIdentity(android.system.Os.stat(node.path())); }
+                catch (android.system.ErrnoException error) { throw new IOException(error); }
+            }
+            return RootDirectoryReader.stat(node.path(), "%d:%i:%s:%Y:%a:%u:%g", true);
+        }
+        Node current = document(node.uri);
+        return node.uri + ":" + current.size + ":" + current.modified;
+    }
+    static String statIdentity(android.system.StructStat stat) {
+        return stat.st_dev + ":" + stat.st_ino + ":" + stat.st_size + ":" + stat.st_mtime + ":"
+                + Integer.toOctalString(stat.st_mode & 07777) + ":" + stat.st_uid + ":" + stat.st_gid;
+    }
+    static String digest(InputStream input) throws IOException {
+        MessageDigest digest;
+        try { digest = MessageDigest.getInstance("SHA-256"); }
+        catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        byte[] buffer = new byte[128 * 1024]; int count;
+        while ((count = input.read(buffer)) != -1) if (count > 0) { Tasks.Progress.check(); digest.update(buffer, 0, count); }
+        StringBuilder value = new StringBuilder(64);
+        for (byte b : digest.digest()) {
+            value.append("0123456789abcdef".charAt((b & 255) >>> 4));
+            value.append("0123456789abcdef".charAt(b & 15));
+        }
+        return value.toString();
+    }
+    private void checkRevision(Node node, String expected) throws IOException {
+        if (expected != null && !expected.equals(fingerprint(node)))
+            throw new IOException("原文件已在外部改变，请刷新或重新打开后合并修改");
+    }
+    void write(Node node, File content) throws IOException { write(node, content, null); }
+    String write(Node node, File content, String expected) throws IOException {
+        Tasks.Progress.check();
         checkWritable(node);
+        checkRevision(node, expected);
         node = RootAccess.automatic(node);
         if (node.container != null) {
-            editArchive(node.container, null, null, Map.of(node.entry, content));
+            editArchive(node.container, null, null, Map.of(node.entry, content), expected);
         } else if (node.uri != null) {
-            try (InputStream in = new FileInputStream(content);
-                 OutputStream out = context.getContentResolver().openOutputStream(node.uri, "wt")) {
-                if (out == null) throw new IOException("此目录只读");
-                pump(in, out);
-            }
+            SafRecovery.write(context, node, content, expected);
         } else if (node.root) {
-            applyRoot(content, node);
+            applyRoot(new FileInputStream(content), content.length(), node, expected);
         } else {
             FileState before = FileState.read(node.file);
+            if (expected != null && !expected.equals(before.fingerprint()))
+                throw new IOException("原文件已在外部改变，请重新打开");
             File tmp = File.createTempFile(".dualstack-", ".tmp", node.file.getParentFile());
             try {
                 Files.copy(content.toPath(), tmp.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                Tasks.Progress.check();
                 publish(tmp, node.file, before);
             } finally { Files.deleteIfExists(tmp.toPath()); }
         }
         if (node.file != null) ArchiveOps.forget(node.file);
+        String revision = fingerprint(node);
+        String expectedDigest;
+        try (InputStream input = new FileInputStream(content)) { expectedDigest = digest(input); }
+        String actualDigest = revision.substring(revision.lastIndexOf(':') + 1);
+        if (node.container != null) {
+            try (InputStream input = read(node)) { actualDigest = digest(input); }
+            checkRevision(node, revision);
+        }
+        if (!expectedDigest.equals(actualDigest)) throw new IOException("写入后的来源内容与待保存内容不一致，请重新核对来源文件");
+        return revision;
     }
     /** Publish only a complete payload, preserving the original mode and owner. */
     private String applyRoot(File staged, Node node) throws IOException {
@@ -254,16 +364,17 @@ final class FileStore {
     }
     /** The command checks the written size against {@code size} before publishing, so a short stream never replaces data. */
     private String applyRoot(InputStream payload, long size, Node node) throws IOException {
+        return applyRoot(payload, size, node, null);
+    }
+    private String applyRoot(InputStream payload, long size, Node node, String expected) throws IOException {
         String temporary = node.path() + ".dualstack-" + UUID.randomUUID();
-        String command = rootWriteCommand(node.path(), temporary, size);
+        String command = rootWriteCommand(context.getApplicationInfo().sourceDir, node.path(), temporary, size, expected);
         try (InputStream input = payload) {
             ShellRunner.Result result = new ShellRunner().run(command, null, true, 300000, null, true, input);
             if (result.timedOut()) throw new IOException("ROOT 写入超时");
             if (result.exitCode() != 0) throw new IOException("ROOT 写入失败\n" + result.output());
             String[] lines = result.output().trim().split("\n");
             return lines[lines.length - 1].trim();
-        } finally {
-            shell("/system/bin/toybox rm -f -- " + quote(temporary), true);
         }
     }
 
@@ -288,18 +399,12 @@ final class FileStore {
             return document(u);
         }
         File f = new File(parent.file, name);
-        if (parent.root) {
-            String path = quote(f.getAbsolutePath()), container = quote(parent.file.getAbsolutePath());
-            // Inherit the parent's owner so FUSE-visible entries stay owned by the storage user, not ROOT.
-            shell((directory ? "mkdir " + path : "(set -C; : > " + path + ")") + " || exit 1;"
-                    + " owner=$(/system/bin/toybox stat -c '%u:%g' " + container + " 2>/dev/null);"
-                    + " [ -n \"$owner\" ] && /system/bin/toybox chown \"$owner\" " + path + " 2>/dev/null; exit 0", true);
-            return new Node(name, f, null, directory, true, 0, System.currentTimeMillis());
-        }
+        if (parent.root) return RootMutations.create(context, parent, name, directory);
         if (!(directory ? f.mkdir() : f.createNewFile())) throw new IOException("无法创建 " + name);
         return local(f);
     }
     Node rename(Node node, String name) throws IOException {
+        Tasks.Progress.check();
         checkRemoval(node);
         node = RootAccess.automatic(node);
         checkName(name);
@@ -316,31 +421,30 @@ final class FileStore {
             return document(u);
         }
         File to = new File(node.file.getParentFile(), name);
-        if (node.root) {
-            shell("test ! -e " + quote(to.getAbsolutePath()) + " && mv "
-                    + quote(node.path()) + " " + quote(to.getAbsolutePath()), true);
-            return local(to, true);
-        }
+        if (node.root) return RootMutations.rename(context, node, parent(node), name);
         if (to.exists()) throw new IOException("同名文件已存在");
         Files.move(node.file.toPath(), to.toPath());
         return local(to);
     }
     void delete(Node node) throws IOException {
+        Tasks.Progress.check();
         checkRemoval(node);
         node = RootAccess.automatic(node);
         if (node.container != null) {
             if (node.entry.isEmpty()) throw new IOException("不能删除归档根目录");
+            Tasks.Progress.step(node.name);
             editArchive(node.container, node.entry, null, Collections.emptyMap());
         } else if (node.uri != null) {
+            Tasks.Progress.step(node.name);
             if (!DocumentsContract.deleteDocument(context.getContentResolver(), node.uri)) throw new IOException("删除失败");
         } else if (node.root) {
-            if (node.path().equals("/") || node.path().equals("/storage/emulated/0")) throw new IOException("不能删除存储根目录");
-            shell("rm -rf -- " + quote(node.path()), true);
+            RootMutations.delete(context, List.of(node));
         } else {
             deleteLocal(node.file.toPath());
         }
     }
     void deleteAll(Collection<Node> requested) throws IOException {
+        Tasks.Progress.check();
         for (Node node : requested) {
             checkRemoval(node);
             if (node.container != null && node.entry.isEmpty()) throw new IOException("不能删除归档根目录");
@@ -356,42 +460,25 @@ final class FileStore {
             else if (node.file != null && !node.directory) localFiles.add(node);
             else ordinary.add(node);
         }
-        String prefix = "/system/bin/toybox rm -rf --";
-        StringBuilder command = new StringBuilder(prefix);
-        int bytes = ShellRunner.quotedPayloadBytes(prefix);
-        for (Node node : roots.values()) {
-            String argument = " " + quote(node.path());
-            int length = ShellRunner.quotedPayloadBytes(argument);
-            if (ShellRunner.quotedPayloadBytes(prefix) + length > 65536) {
-                // A single deep path can exceed the wrapper budget despite fitting PATH_MAX.
-                File script = File.createTempFile("delete-", ".sh", context.getCacheDir());
-                try {
-                    Files.write(script.toPath(), (prefix + argument + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                    shell("/system/bin/sh " + quote(script.getAbsolutePath()), true);
-                } finally { Files.deleteIfExists(script.toPath()); }
-                continue;
-            }
-            // Leave ample space for pid/session wrappers under the kernel's per-argument limit.
-            if (bytes + length > 65536 && command.length() > prefix.length()) {
-                shell(command.toString(), true); command = new StringBuilder(prefix);
-                bytes = ShellRunner.quotedPayloadBytes(prefix);
-            }
-            command.append(argument); bytes += length;
-        }
-        if (command.length() > prefix.length()) shell(command.toString(), true);
+        if (!roots.isEmpty()) RootMutations.delete(context, roots.values());
         for (List<Node> entries : archives.values()) {
             synchronized (ArchiveOps.class) {
                 Node source = RootAccess.automatic(entries.get(0).container);
+                String baseline = fingerprint(source);
                 File archive = materialize(source);
                 try {
                     Set<String> removals = new HashSet<>();
-                    for (Node entry : entries) removals.add(entry.entry);
+                    for (Node entry : entries) { Tasks.Progress.step(entry.name); removals.add(entry.entry); }
+                    checkRevision(source, baseline);
                     ArchiveOps.removeAll(archive, removals);
-                    if (source.file == null || source.root) write(source, archive);
+                    if (source.file == null || source.root) write(source, archive, baseline);
                 } finally { release(source, archive); }
             }
         }
-        for (Node node : localFiles) Files.deleteIfExists(node.file.toPath());
+        for (Node node : localFiles) {
+            Tasks.Progress.step(node.name);
+            Files.deleteIfExists(node.file.toPath());
+        }
         for (Node node : ordinary) delete(node);
     }
     /** Resolves a path outside the app's ordinary view of the filesystem; falls back to the plain path. */
@@ -412,11 +499,13 @@ final class FileStore {
         Files.walkFileTree(path, new java.nio.file.SimpleFileVisitor<>() {
             @Override public java.nio.file.FileVisitResult visitFile(java.nio.file.Path file,
                     java.nio.file.attribute.BasicFileAttributes attributes) throws IOException {
+                Tasks.Progress.step(file.getFileName().toString());
                 Files.delete(file); return java.nio.file.FileVisitResult.CONTINUE;
             }
             @Override public java.nio.file.FileVisitResult postVisitDirectory(java.nio.file.Path directory,
                     IOException error) throws IOException {
                 if (error != null) throw error;
+                Tasks.Progress.step(directory.getFileName().toString());
                 Files.delete(directory); return java.nio.file.FileVisitResult.CONTINUE;
             }
         });
@@ -431,7 +520,8 @@ final class FileStore {
         for (Node source : sources) copied.add(copy(source, parent, move, names));
         return copied;
     }
-    private Node copy(Node source, Node parent, boolean move, Map<String, Set<String>> names) throws IOException {
+    Node copy(Node source, Node parent, boolean move, Map<String, Set<String>> names) throws IOException {
+        Tasks.Progress.check();
         if (move) checkRemoval(source);
         source = RootAccess.automatic(source);
         parent = RootAccess.automatic(parent);
@@ -479,17 +569,11 @@ final class FileStore {
         if (move && source.file != null && parent.file != null) {
             File destination = new File(parent.file, name);
             if (source.root || parent.root) {
-                String from = quote(source.path()), to = quote(destination.getAbsolutePath());
-                String command = "test ! -e " + to + " && test ! -L " + to
-                        + " && /system/bin/toybox mv -n -- " + from + " " + to
-                        + " && test ! -e " + from + " && test ! -L " + from;
-                ShellRunner.Result result = new ShellRunner().run(command, null, true, 30 * 60 * 1000L, null, false);
-                if (result.timedOut() || result.exitCode() != 0)
-                    throw new IOException("移动未完成，源或目标可能保留部分内容，请检查后重试\n" + result.output());
-                return new Node(name, destination, null, source.directory, parent.root, source.size, source.modified);
-            }
-            try {
+                Node moved = RootMutations.moveIfSameFileSystem(context, source, parent, name);
+                if (moved != null) return moved;
+            } else try {
                 if (android.system.Os.stat(source.path()).st_dev == android.system.Os.stat(parent.path()).st_dev) {
+                    Tasks.Progress.step(source.name);
                     Files.move(source.file.toPath(), destination.toPath());
                     return local(destination);
                 }
@@ -534,19 +618,21 @@ final class FileStore {
         }
         seen.remove(key);
     }
-    private final class CopyLedger {
+    final class CopyLedger {
         private final Map<Node, String> created = new LinkedHashMap<>();
-        void record(Node node) throws IOException { created.put(node, identity(node)); }
-        void published(Node node, String identity) { created.put(node, identity); }
+        void record(Node node) throws IOException {
+            created.put(node, node.root && node.identity != null ? node.identity : identity(node));
+        }
+        void published(Node node, String identity) {
+            created.put(node, identity); node.identity = identity; node.identityFollowsLinks = false;
+        }
         private String identity(Node node) throws IOException {
             if (node.file == null) return node.key();
+            if (node.root) return RootDirectoryReader.stat(node.path(), "%d:%i", false);
             try {
                 android.system.StructStat stat = android.system.Os.lstat(node.path());
-                return stat.st_dev + ":" + stat.st_ino;
-            } catch (android.system.ErrnoException error) {
-                if (!node.root) throw new IOException(error);
-                return shell("/system/bin/toybox stat -c '%d:%i' " + quote(node.path()), true).trim();
-            }
+                return fileIdentity(stat);
+            } catch (android.system.ErrnoException error) { throw new IOException(error); }
         }
         void rollback(Exception failure) {
             List<Node> nodes = new ArrayList<>(created.keySet());
@@ -559,7 +645,7 @@ final class FileStore {
                             throw new IOException("无法清理未完成的复制：" + node.name);
                     }
                 } else if (node.root) {
-                    shell("/system/bin/toybox " + (node.directory ? "rmdir" : "rm -f") + " -- " + quote(node.path()), true);
+                    Tasks.Progress.cleanup(() -> RootMutations.removeEmpty(context, node));
                 } else Files.deleteIfExists(node.file.toPath());
             } catch (IOException | RuntimeException cleanup) { failure.addSuppressed(cleanup); }
         }
@@ -577,10 +663,11 @@ final class FileStore {
         } else {
             // Targets are newly created; direct streaming needs no second complete cache copy.
             if (target.root) {
-                if (source.file != null && !source.root && source.container == null && source.file.isFile()) {
-                    // A plain readable file has a reliable length, so it streams straight into the verified ROOT write.
-                    long size = source.file.length();
-                    try (InputStream in = new BufferedInputStream(new FileInputStream(source.file))) {
+                if (copyCreatedFileLocally(source, target)) {
+                    // The newly created inode remains the ledger's owned inode.
+                } else if (source.file != null && source.container == null && source.file.isFile() && source.file.canRead()) {
+                    long size = source.root ? Long.parseLong(RootDirectoryReader.stat(source.path(), "%s", true)) : source.file.length();
+                    try (InputStream in = read(source)) {
                         ledger.published(target, applyRoot(in, size, target));
                     }
                 } else {
@@ -601,6 +688,33 @@ final class FileStore {
         }
         seen.remove(key);
     }
+    /** Fast path for a newly created ROOT target also writable by the app, with ROOT inode guards. */
+    private boolean copyCreatedFileLocally(Node source, Node target) throws IOException {
+        if (source.file == null || source.container != null || source.directory || target.file == null
+                || target.identity == null || target.parentIdentity == null) return false;
+        java.io.FileDescriptor descriptor;
+        try {
+            descriptor = android.system.Os.open(target.path(), android.system.OsConstants.O_WRONLY
+                    | android.system.OsConstants.O_NOFOLLOW | android.system.OsConstants.O_NONBLOCK, 0);
+        } catch (android.system.ErrnoException unavailable) { return false; }
+        try (FileOutputStream output = SafRecovery.ownedOutput(descriptor)) {
+            android.system.StructStat opened = android.system.Os.fstat(output.getFD());
+            if (!android.system.OsConstants.S_ISREG(opened.st_mode) || opened.st_size != 0 || opened.st_nlink != 1
+                    || !target.identity.equals(fileIdentity(opened))
+                    || !target.parentIdentity.equals(fileIdentity(android.system.Os.stat(target.file.getParent())))) return false;
+            if (!target.identity.equals(RootDirectoryReader.stat(target.path(), "%d:%i", true)))
+                throw new IOException("新建目标身份已变化，复制已停止");
+            long expectedSize = source.root ? Long.parseLong(RootDirectoryReader.stat(source.path(), "%s", true)) : source.file.length();
+            try (InputStream input = read(source)) { pump(input, output); }
+            output.flush(); output.getFD().sync();
+            if (android.system.Os.fstat(output.getFD()).st_size != expectedSize)
+                throw new IOException("来源长度在复制期间发生变化");
+            if (!target.identity.equals(RootDirectoryReader.stat(target.path(), "%d:%i", true))
+                    || !target.parentIdentity.equals(RootDirectoryReader.stat(target.file.getParent(), "%d:%i", true)))
+                throw new IOException("复制期间目标位置已变化");
+            return true;
+        } catch (android.system.ErrnoException error) { throw new IOException(error); }
+    }
     Node extract(List<Node> sources, Node parent, String folderName) throws IOException {
         if (sources.isEmpty()) throw new IOException("请选择压缩包或包内条目");
         checkName(folderName);
@@ -611,7 +725,7 @@ final class FileStore {
         try {
             if (sources.size() == 1 && sources.get(0).container == null) {
                 Node source = sources.get(0);
-                File archive = materialize(source);
+                File archive = archiveView(source);
                 try {
                     if (output.file != null && !output.root) ArchiveOps.extract(archive, "", output.file);
                     else {
@@ -624,7 +738,7 @@ final class FileStore {
                 for (Node source : sources) {
                     if (source.container == null) throw new IOException("请选择同一压缩包内的条目");
                     // The archive index validates paths; selected entries use the same bounded extractor.
-                    File archive = materialize(source.container);
+                    File archive = archiveView(source.container);
                     try {
                         if (staged == null) staged = Files.createTempDirectory(context.getCacheDir().toPath(), "extract-").toFile();
                         ArchiveOps.extract(archive, source.entry, staged, true);
@@ -634,9 +748,14 @@ final class FileStore {
             }
             return output;
         } catch (IOException | RuntimeException error) {
-            try { delete(output); } catch (IOException cleanup) { error.addSuppressed(cleanup); }
+            try { Tasks.Progress.cleanup(() -> delete(output)); } catch (IOException cleanup) { error.addSuppressed(cleanup); }
             throw error;
-        } finally { if (staged != null) delete(local(staged)); }
+        } finally {
+            if (staged != null) {
+                File temporary = staged;
+                Tasks.Progress.cleanup(() -> delete(local(temporary)));
+            }
+        }
     }
     String unique(Node parent, String original) throws IOException {
         Set<String> names = new HashSet<>();
@@ -675,25 +794,33 @@ final class FileStore {
         // Protected and provider-backed inputs keep private lifetimes; metadata alone cannot prove their freshness.
         return materialize(node);
     }
-    private static void checkRemoval(Node node) throws IOException {
+    static void checkRemoval(Node node) throws IOException {
         if (node.file != null && RootAccess.protectedStorageDirectory(node.file))
             throw new IOException("不能删除、移动或重命名存储根目录及 Android/data、Android/obb");
     }
     private void editArchive(Node source, String remove, String rename, Map<String, File> additions) throws IOException {
+        editArchive(source, remove, rename, additions, null);
+    }
+    private void editArchive(Node source, String remove, String rename, Map<String, File> additions, String expected) throws IOException {
         synchronized (ArchiveOps.class) {
             checkWritable(source);
             source = RootAccess.automatic(source);
-            File archive = materialize(source);
+            String baseline = expected == null ? fingerprint(source) : expected;
+            checkRevision(source, baseline);
+            File archive = File.createTempFile("archive-edit-", "-" + source.name.replaceAll("[^a-zA-Z0-9.]", "_"), context.getCacheDir());
             try {
+                try (InputStream input = read(source); OutputStream output = new FileOutputStream(archive)) { pump(input, output); }
+                if (source.file != null) ArchiveOps.copyPassword(source.file, archive);
+                checkRevision(source, baseline);
                 ArchiveOps.rewrite(archive, remove, rename, additions);
-                if (source.file == null || source.root) write(source, archive);
+                write(source, archive, baseline);
             } finally { release(source, archive); }
         }
     }
     static void pump(InputStream in, OutputStream out) throws IOException {
         byte[] buffer = new byte[128 * 1024];
         int n;
-        while ((n = in.read(buffer)) != -1) if (n > 0) out.write(buffer, 0, n);
+        while ((n = in.read(buffer)) != -1) if (n > 0) { Tasks.Progress.check(); out.write(buffer, 0, n); Tasks.Progress.bytes(n); }
         out.flush();
     }
     static byte[] readBytes(InputStream in, int limit) throws IOException {
@@ -717,27 +844,39 @@ final class FileStore {
             left--;
         }
     }
-    record FileState(long device, long inode, long size, long modified, int mode, int uid, int gid) {
-        static FileState read(File file) throws IOException {
+    record FileState(long device, long inode, long size, long modified, int mode, int uid, int gid, String digest) {
+        private static FileState metadata(File file) throws IOException {
             try {
                 android.system.StructStat stat = android.system.Os.lstat(file.getAbsolutePath());
                 if (android.system.OsConstants.S_ISLNK(stat.st_mode))
                     throw new IOException("不能直接保存符号链接，请打开真实文件");
                 if (!android.system.OsConstants.S_ISREG(stat.st_mode)) throw new IOException("保存目标不是普通文件");
                 return new FileState(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime,
-                        stat.st_mode & 07777, stat.st_uid, stat.st_gid);
+                        stat.st_mode & 07777, stat.st_uid, stat.st_gid, null);
             } catch (android.system.ErrnoException error) { throw new IOException(error); }
+        }
+        static FileState read(File file) throws IOException {
+            FileState before = metadata(file);
+            String digest;
+            try (InputStream input = new FileInputStream(file)) { digest = FileStore.digest(input); }
+            if (!before.equals(metadata(file))) throw new IOException("读取期间文件已变化");
+            return new FileState(before.device, before.inode, before.size, before.modified,
+                    before.mode, before.uid, before.gid, digest);
+        }
+        String fingerprint() {
+            return device + ":" + inode + ":" + size + ":" + modified + ":" + Integer.toOctalString(mode)
+                    + ":" + uid + ":" + gid + ":" + digest;
         }
     }
     static void publish(File tmp, File target, FileState before) throws IOException {
         try {
-            FileState staged = FileState.read(tmp);
+            FileState staged = FileState.metadata(tmp);
             if ((staged.mode & 0200) == 0) android.system.Os.chmod(tmp.getAbsolutePath(), staged.mode | 0200);
             try (RandomAccessFile output = new RandomAccessFile(tmp, "rw")) { output.getFD().sync(); }
             if (staged.uid != before.uid || staged.gid != before.gid)
                 android.system.Os.chown(tmp.getAbsolutePath(), before.uid, before.gid);
-            if (FileState.read(tmp).mode != before.mode) android.system.Os.chmod(tmp.getAbsolutePath(), before.mode);
-            FileState ready = FileState.read(tmp);
+            if (FileState.metadata(tmp).mode != before.mode) android.system.Os.chmod(tmp.getAbsolutePath(), before.mode);
+            FileState ready = FileState.metadata(tmp);
             if (ready.uid != before.uid || ready.gid != before.gid || ready.mode != before.mode)
                 throw new IOException("无法保留原文件权限，原文件未替换");
             if (!before.equals(FileState.read(target))) throw new IOException("保存目标已在外部改变，请重新打开");
@@ -756,22 +895,9 @@ final class FileStore {
             throw new IOException("文件名无效");
     }
     static String quote(String s) { return "'" + s.replace("'", "'\\''") + "'"; }
-    static String rootWriteCommand(String path, String temporary) { return rootWriteCommand(path, temporary, -1); }
-    static String rootWriteCommand(String path, String temporary, long size) {
-        String source = quote(path), tmp = quote(temporary);
-        String stat = "/system/bin/toybox stat";
-        String identity = stat + " -c '%d:%i:%s:%Y:%a:%u:%g' " + source;
-        String verify = size < 0 ? "" : " && [ \"$(" + stat + " -c %s " + tmp + ")\" = " + size + " ]";
-        return "if [ -L " + source + " ]; then printf '%s\\n' '不能直接保存符号链接，请打开真实文件' >&2; exit 1; fi; "
-                + "test -f " + source + " || exit 1; before=$(" + identity + ") || exit 1; "
-                + "mode=$(" + stat + " -c %a " + source + ") && owner=$(" + stat + " -c '%u:%g' " + source + ") || exit 1; "
-                + "(set -C; : > " + tmp + ") || exit 1; "
-                + "{ cat > " + tmp + verify
-                + " && chown \"$owner\" " + tmp + " && chmod \"$mode\" " + tmp
-                + " && [ \"$(" + stat + " -c '%a:%u:%g' " + tmp + ")\" = \"$mode:$owner\" ]"
-                + " && test ! -L " + source + " && [ \"$(" + identity + ")\" = \"$before\" ]"
-                + " && published=$(" + stat + " -c '%d:%i' " + tmp + ")"
-                + " && mv " + tmp + " " + source + " && printf '%s\\n' \"$published\"; } || { rm -f " + tmp + "; exit 1; }";
+    static String rootWriteCommand(String apk, String path, String temporary, long size, String expected) {
+        return "CLASSPATH=" + quote(apk) + " /system/bin/app_process /system/bin com.dualstack.lab.RootWriter "
+                + quote(path) + " " + quote(temporary) + " " + size + " " + quote(expected == null ? "" : expected);
     }
     static String shell(String command, boolean root) throws IOException {
         ShellRunner.Result result = new ShellRunner().run(command, null, root, 45000, null, false);

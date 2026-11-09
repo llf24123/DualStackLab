@@ -8,7 +8,7 @@ import android.widget.*;
 import java.io.File;
 
 final class NavigationDrawer {
-    static Dialog show(Activity activity, Runnable root, Runnable internal, Runnable installed) {
+    static Dialog show(Activity activity, Runnable root, Runnable internal, Runnable installed, Runnable recycleBin) {
         Dialog dialog = new Dialog(activity); dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout body = Ui.column(activity); body.setBackgroundColor(Ui.SURFACE);
         LinearLayout header = Ui.row(activity); header.setBackgroundColor(Ui.INK);
@@ -20,14 +20,18 @@ final class NavigationDrawer {
         title.setPadding(Ui.dp(activity, 14), 0, 0, 0);
         header.addView(title, new LinearLayout.LayoutParams(0, Ui.dp(activity, 56), 1));
         header.addView(Ui.icon(activity, R.drawable.ic_theme, "主题切换", Color.WHITE,
-                () -> { dialog.dismiss(); Ui.chooseTheme(activity); }), new LinearLayout.LayoutParams(Ui.dp(activity, 44), Ui.dp(activity, 48)));
+                () -> { dialog.dismiss(); Ui.chooseTheme(activity); }), new LinearLayout.LayoutParams(Ui.dp(activity, 48), Ui.dp(activity, 48)));
         body.addView(header);
-        ScrollView scroll = new ScrollView(activity); LinearLayout content = Ui.column(activity); scroll.addView(content);
+        ScrollView scroll = new ScrollView(activity); scroll.setContentDescription("位置与工具列表");
+        LinearLayout content = Ui.column(activity); scroll.addView(content);
         content.addView(section(activity, "本地"));
         storage(activity, content, "根目录", new File("/"), dialog, root);
         storage(activity, content, "内部存储", Environment.getExternalStorageDirectory(), dialog, internal);
         content.addView(section(activity, "工具"));
+        content.addView(row(activity, "任务中心", R.drawable.ic_copy, () -> { dialog.dismiss(); activity.startActivity(new android.content.Intent(activity, TaskCenterActivity.class)); }));
+        content.addView(row(activity, "设备信息", R.drawable.ic_info, () -> { dialog.dismiss(); activity.startActivity(new android.content.Intent(activity, DeviceInfoActivity.class)); }));
         content.addView(row(activity, "已安装应用", R.drawable.ic_package, () -> { dialog.dismiss(); installed.run(); }));
+        content.addView(row(activity, "回收站", R.drawable.ic_trash, () -> { dialog.dismiss(); recycleBin.run(); }));
         body.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         dialog.setContentView(body); Window window = dialog.getWindow();
         if (window == null) return dialog;

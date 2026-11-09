@@ -31,8 +31,11 @@ final class Tasks {
         });
     }
     static void showError(Activity a, Exception e) {
+        SafRecovery.RecoveryException recovery = SafRecovery.findRecovery(e);
+        if (recovery != null && SafRecovery.enabled(a)) { SafRecovery.showRecovery(a, recovery); return; }
+        Throwable shown = recovery != null && recovery.getCause() != null ? recovery.getCause() : e;
         new AlertDialog.Builder(a).setTitle("操作失败")
-                .setMessage(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage())
+                .setMessage(shown.getMessage() == null ? shown.getClass().getSimpleName() : shown.getMessage())
                 .setPositiveButton("确定", null).show();
     }
     static void toast(Activity a, String text) { Toast.makeText(a, text, Toast.LENGTH_SHORT).show(); }
@@ -45,12 +48,35 @@ final class Tasks {
         private static final ThreadLocal<Progress> CURRENT = new ThreadLocal<>();
         final java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
         final java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicLong transferred = new java.util.concurrent.atomic.AtomicLong();
         volatile String current = "";
+        static void bytes(long count) {
+            Progress progress = CURRENT.get();
+            if (progress != null && count > 0) progress.transferred.addAndGet(count);
+        }
+        static Runnable bind(Runnable work) {
+            Progress inherited = CURRENT.get();
+            return () -> {
+                Progress old = CURRENT.get();
+                if (inherited != null) CURRENT.set(inherited); else CURRENT.remove();
+                try { work.run(); } finally { if (old != null) CURRENT.set(old); else CURRENT.remove(); }
+            };
+        }
+        static void check() throws CancelledException {
+            Progress progress = CURRENT.get();
+            if (progress != null && progress.cancelled.get()) throw new CancelledException();
+        }
         static void step(String name) throws CancelledException {
+            check();
             Progress progress = CURRENT.get();
             if (progress == null) return;
-            if (progress.cancelled.get()) throw new CancelledException();
             progress.current = name == null ? "" : name; progress.done.incrementAndGet();
+        }
+        interface Cleanup { void run() throws java.io.IOException; }
+        static void cleanup(Cleanup work) throws java.io.IOException {
+            Progress previous = CURRENT.get(); CURRENT.remove();
+            try { work.run(); }
+            finally { if (previous != null) CURRENT.set(previous); }
         }
         <T> T run(Job<T> job) throws Exception {
             CURRENT.set(this);

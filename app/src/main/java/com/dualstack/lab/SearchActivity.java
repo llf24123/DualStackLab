@@ -63,7 +63,7 @@ public class SearchActivity extends LabActivity {
         LinearLayout root = Ui.column(this);
         root.addView(Ui.toolbar(this, "搜索", this::finish), new LinearLayout.LayoutParams(-1, Ui.dp(this, 52)));
         root.addView(buildQueryBar());
-        root.addView(buildChips(), new LinearLayout.LayoutParams(-1, Ui.dp(this, 44)));
+        root.addView(buildChips(), new LinearLayout.LayoutParams(-1, Ui.dp(this, 48)));
         LinearLayout status = Ui.row(this); status.setPadding(Ui.dp(this, 16), 0, Ui.dp(this, 16), 0);
         spinner = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall); spinner.setIndeterminate(true);
         spinner.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(Ui.ACCENT));
@@ -113,9 +113,9 @@ public class SearchActivity extends LabActivity {
             if (event == null || event.getAction() == android.view.KeyEvent.ACTION_UP) begin();
             return true;
         });
-        bar.addView(query, new LinearLayout.LayoutParams(0, Ui.dp(this, 44), 1));
+        bar.addView(query, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
         action = Ui.icon(this, R.drawable.ic_search, "开始搜索", Ui.ACCENT, this::toggleSearch);
-        bar.addView(action, new LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 44)));
+        bar.addView(action, new LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)));
         return bar;
     }
     private View buildChips() {
@@ -133,7 +133,8 @@ public class SearchActivity extends LabActivity {
         TextView chip = Ui.single(this, label, 13, Ui.MUTED); chip.setGravity(Gravity.CENTER);
         chip.setContentDescription(description); chip.setPadding(Ui.dp(this, 12), 0, Ui.dp(this, 12), 0);
         chip.setOnClickListener(v -> { flip.run(); updateChips(); });
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, Ui.dp(this, 32)); params.rightMargin = Ui.dp(this, 8);
+        chip.setFocusable(true);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, Ui.dp(this, 48)); params.rightMargin = Ui.dp(this, 8);
         row.addView(chip, params);
         return chip;
     }
@@ -209,7 +210,7 @@ public class SearchActivity extends LabActivity {
             TextView previous = Ui.text(this, "查看上次搜索", 14, Ui.ACCENT); previous.setGravity(Gravity.CENTER);
             previous.setBackground(Ui.ripple(Ui.SURFACE));
             previous.setOnClickListener(v -> { startActivity(new Intent(this, SearchActivity.class)); finish(); });
-            history.addView(previous, new LinearLayout.LayoutParams(-1, Ui.dp(this, 44)));
+            history.addView(previous, new LinearLayout.LayoutParams(-1, Ui.dp(this, 48)));
         }
         if (recent.isEmpty()) return;
         LinearLayout heading = Ui.row(this);
@@ -223,7 +224,7 @@ public class SearchActivity extends LabActivity {
             LinearLayout row = Ui.row(this); row.setBackground(Ui.ripple(Ui.SURFACE));
             ImageView icon = Ui.image(this, R.drawable.ic_search, Ui.MUTED); icon.setPadding(Ui.dp(this, 2), 0, Ui.dp(this, 10), 0);
             row.addView(icon, new LinearLayout.LayoutParams(Ui.dp(this, 30), Ui.dp(this, 20)));
-            row.addView(Ui.single(this, value, 15, Ui.TEXT), new LinearLayout.LayoutParams(0, Ui.dp(this, 44), 1));
+            row.addView(Ui.single(this, value, 15, Ui.TEXT), new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
             row.setContentDescription("最近搜索 " + value);
             row.setOnClickListener(v -> { query.setText(value); query.setSelection(value.length()); begin(); });
             history.addView(row);

@@ -137,6 +137,7 @@ final class Ui {
         v.setHint(hint);
         v.setSingleLine(true);
         v.setPadding(dp(c, 12), dp(c, 8), dp(c, 12), dp(c, 8));
+        v.setMinHeight(dp(c, 48));
         return v;
     }
 
@@ -156,8 +157,8 @@ final class Ui {
         v.setBackground(ripple(Color.TRANSPARENT));
         v.setFocusable(true);
         v.setOnClickListener(x -> action.run());
-        v.setMinimumWidth(dp(c, 44));
-        v.setMinimumHeight(dp(c, 44));
+        v.setMinimumWidth(dp(c, 48));
+        v.setMinimumHeight(dp(c, 48));
         return v;
     }
 
@@ -175,6 +176,7 @@ final class Ui {
         v.setTooltipText(title);
         v.setBackground(ripple(SURFACE));
         v.setOnClickListener(x -> action.run());
+        v.setMinimumHeight(dp(c, 48)); v.setMinimumWidth(dp(c, 48)); v.setFocusable(true);
         return v;
     }
 
@@ -197,15 +199,19 @@ final class Ui {
         return v;
     }
 
-    static final int MOTION_SHORT = 160;
+    static final int MOTION_SHORT = 180;
+    static final int MOTION_PANEL = 220;
+    static final android.view.animation.Interpolator EASING = new android.view.animation.PathInterpolator(.2f, 0f, 0f, 1f);
+    static boolean motionEnabled() { return android.animation.ValueAnimator.areAnimatorsEnabled(); }
 
     /** Cross-fades a solid background; a colour already showing, or a view not on screen, switches at once. */
     static void fadeBackground(View view, int to) {
         Object running = view.getTag(R.id.motion_color);
         if (running instanceof android.animation.ValueAnimator animator) animator.cancel();
         int from = view.getBackground() instanceof android.graphics.drawable.ColorDrawable color ? color.getColor() : to;
-        if (from == to || !view.isShown()) { view.setBackgroundColor(to); return; }
+        if (from == to || !view.isShown() || !motionEnabled()) { view.setBackgroundColor(to); return; }
         android.animation.ValueAnimator animator = android.animation.ValueAnimator.ofArgb(from, to).setDuration(MOTION_SHORT);
+        animator.setInterpolator(EASING);
         animator.addUpdateListener(a -> view.setBackgroundColor((int) a.getAnimatedValue()));
         animator.addListener(new android.animation.AnimatorListenerAdapter() {
             @Override public void onAnimationEnd(android.animation.Animator a) { view.setTag(R.id.motion_color, null); }
@@ -214,8 +220,9 @@ final class Ui {
     }
     /** Fades a view in from a dimmed but still visible state, so it never disappears from accessibility. */
     static void fadeIn(View view) {
+        if (!motionEnabled()) { view.animate().cancel(); view.setAlpha(1f); return; }
         view.animate().cancel(); view.setAlpha(.4f);
-        view.animate().alpha(1f).setDuration(MOTION_SHORT).start();
+        view.animate().alpha(1f).setDuration(MOTION_SHORT).setInterpolator(EASING).start();
     }
 
     static void install(Activity a, LinearLayout root) {

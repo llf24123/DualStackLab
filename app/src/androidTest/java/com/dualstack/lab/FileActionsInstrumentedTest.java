@@ -54,7 +54,7 @@ public class FileActionsInstrumentedTest {
         File file = new File(work, "mode.txt"); Files.write(file.toPath(), new byte[]{65});
         for (String mode : List.of("600", "644", "755", "0640", "1750")) {
             int parsed = FilePermissions.parse(mode);
-            FilePermissions.State result = FilePermissions.apply(FileStore.local(file), parsed);
+            FilePermissions.State result = FilePermissions.apply(context,FileStore.local(file), parsed);
             assertEquals(parsed, result.mode());
             assertEquals(parsed, Os.stat(file.getPath()).st_mode & 07777);
         }
@@ -67,10 +67,10 @@ public class FileActionsInstrumentedTest {
     @Test public void directoryPermissionsAndSymlinkProtection() throws Exception {
         File directory = new File(work, "mode-dir"); assertTrue(directory.mkdir());
         File child = new File(directory, "child"); Files.write(child.toPath(), new byte[]{1}); Os.chmod(child.getPath(), 0644);
-        assertEquals(0700, FilePermissions.apply(FileStore.local(directory), 0700).mode());
+        assertEquals(0700, FilePermissions.apply(context,FileStore.local(directory), 0700).mode());
         assertEquals(0644, Os.stat(child.getPath()).st_mode & 07777);
         File link = new File(work, "link"); Os.symlink(child.getPath(), link.getPath());
-        try { FilePermissions.apply(FileStore.local(link), 0600); fail("Link chmod"); } catch (IOException expected) { }
+        try { FilePermissions.apply(context,FileStore.local(link), 0600); fail("Link chmod"); } catch (IOException expected) { }
         assertEquals(0644, Os.stat(child.getPath()).st_mode & 07777);
     }
     @Test public void recursiveDirectoryStatisticsIncludeNestedAndEmptyFiles() throws Exception {
@@ -162,7 +162,7 @@ public class FileActionsInstrumentedTest {
         try {
             FileStore.Node parent = FileStore.directory(rootWork, true);
             FileStore.Node file = store.create(parent, "root.txt", false), dest = store.create(parent, "dest", true);
-            FilePermissions.State changed = FilePermissions.apply(file, 0600);
+            FilePermissions.State changed = FilePermissions.apply(context,file, 0600);
             assertEquals(0600, changed.mode());
             String inode = FileStore.shell("stat -c %i " + FileStore.quote(file.path()), true).trim();
             FileStore.Node moved = store.copy(file, dest, true);

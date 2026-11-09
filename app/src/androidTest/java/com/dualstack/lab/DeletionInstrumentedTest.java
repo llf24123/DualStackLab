@@ -30,6 +30,7 @@ public class DeletionInstrumentedTest {
     @After public void cleanup() throws Exception { store.delete(FileStore.local(work)); }
 
     @Test public void measureRootBulkDeletion() throws Exception {
+        Assume.assumeTrue("Requires su", RootAccess.available());
         List<FileStore.Node> nodes = new ArrayList<>();
         for (int i = 0; i < 120; i++) {
             File file = new File(work, "small-" + i + ".ini");
@@ -93,6 +94,7 @@ public class DeletionInstrumentedTest {
     }
 
     @Test public void rootBatchChunksLongUnicodeNamesAndPreservesUnselectedFile() throws Exception {
+        Assume.assumeTrue("Requires su", RootAccess.available());
         List<FileStore.Node> nodes = new ArrayList<>();
         for (int i = 0; i < 280; i++) {
             File file = new File(work, "quoted' " + "中文".repeat(20) + i + ".ini");
@@ -103,6 +105,7 @@ public class DeletionInstrumentedTest {
     }
 
     @Test public void rootBatchAccountsForNestedQuotesBeforeKernelArgumentLimit() throws Exception {
+        Assume.assumeTrue("Requires su", RootAccess.available());
         List<FileStore.Node> nodes = new ArrayList<>();
         for (int i = 0; i < 38; i++) {
             File file = new File(work, "'".repeat(200) + i + ".ini");

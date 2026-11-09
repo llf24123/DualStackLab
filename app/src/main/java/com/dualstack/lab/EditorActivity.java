@@ -37,6 +37,8 @@ public class EditorActivity extends LabActivity {
     private CodeLanguage.Kind kind = CodeLanguage.Kind.GENERIC;
     private TextView position, matchCount, regexToggle, caseToggle;
     private LinearLayout searchBar, replaceRow, symbols;
+    private View undoButton, redoButton;
+    private final List<View> bodyControls = new ArrayList<>();
     private EditText findInput, replaceInput;
     private boolean regexSearch, caseSensitive = true, imeVisible = android.os.Build.VERSION.SDK_INT < 30;
     private android.graphics.Typeface defaultTypeface;
@@ -60,6 +62,8 @@ public class EditorActivity extends LabActivity {
     private boolean classEdit() { return "smali-class".equals(mode); }
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        if (saved != null && saved.containsKey("sourceRevision"))
+            getIntent().putExtra("sourceRevision", saved.getString("sourceRevision"));
         store = new FileStore(this);
         session = new ViewModelProvider(this).get(EditorSession.class);
         try { session.initialize(getApplicationContext(), saved == null ? null : saved.getString("editorSession")); }
@@ -73,11 +77,11 @@ public class EditorActivity extends LabActivity {
         String name = getIntent().getStringExtra("displayName");
         if (name == null) name = getIntent().getStringExtra("name");
         LinearLayout top = Ui.toolbar(this, name == null ? "编辑器" : name, this::leave);
-        top.addView(Ui.icon(this, R.drawable.ic_search, "查找与替换", Color.WHITE, this::openSearch), lp(46, 52));
+        top.addView(Ui.icon(this, R.drawable.ic_search, "查找与替换", Color.WHITE, this::openSearch), lp(48, 52));
         View saveButton = Ui.icon(this, R.drawable.ic_save, "保存", Color.WHITE, this::save);
         if (readOnly) saveButton.setVisibility(View.GONE);
-        top.addView(saveButton, lp(46, 52));
-        top.addView(Ui.icon(this, R.drawable.ic_more, "编辑器菜单", Color.WHITE, this::menu), lp(42, 52));
+        top.addView(saveButton, lp(48, 52));
+        top.addView(Ui.icon(this, R.drawable.ic_more, "编辑器菜单", Color.WHITE, this::menu), lp(48, 52));
         root.addView(top, lp(-1, 52));
         root.addView(buildSearchBar());
         editor = new CodeEditor(this); editor.setTabWidth(4);
@@ -92,23 +96,30 @@ public class EditorActivity extends LabActivity {
         root.addView(editor, new LinearLayout.LayoutParams(-1, 0, 1));
         root.addView(Ui.line(this));
         LinearLayout bottom = Ui.row(this); bottom.setBackgroundColor(Ui.SURFACE);
-        bottom.addView(Ui.icon(this, R.drawable.ic_back, "撤销 / 上一页", Ui.TEXT, () -> {
-            if (paged) changePage(false); else editor.undo();
-        }), lp(44, 42));
-        android.view.View redo = Ui.icon(this, R.drawable.ic_back, "重做 / 下一页", Ui.TEXT, () -> {
-            if (paged) changePage(true); else editor.redo();
-        }); redo.setRotation(180); bottom.addView(redo, lp(44, 42));
+        undoButton = Ui.icon(this, R.drawable.ic_back, "撤销 / 上一页", Ui.TEXT, () -> {
+            if (paged) changePage(false); else undo();
+        }); bottom.addView(undoButton, lp(48, 48));
+        redoButton = Ui.icon(this, R.drawable.ic_back, "重做 / 下一页", Ui.TEXT, () -> {
+            if (paged) changePage(true); else redo();
+        }); redoButton.setRotation(180); bottom.addView(redoButton, lp(48, 48));
         info = Ui.single(this, "读取中…", 10, Ui.MUTED);
         bottom.addView(info, new LinearLayout.LayoutParams(0, -1, 1));
         position = Ui.single(this, "", 11, Ui.MUTED); position.setGravity(android.view.Gravity.CENTER);
         position.setPadding(Ui.dp(this, 10), 0, Ui.dp(this, 12), 0); position.setContentDescription("光标位置 · 跳转到行");
-        position.setBackground(Ui.ripple(Ui.SURFACE)); position.setOnClickListener(v -> gotoLine());
-        bottom.addView(position, new LinearLayout.LayoutParams(-2, -1)); root.addView(bottom, lp(-1, 42));
-        root.addView(buildSymbolBar(), lp(-1, 40));
+        position.setMinimumWidth(Ui.dp(this, 48)); position.setBackground(Ui.ripple(Ui.SURFACE)); position.setOnClickListener(v -> gotoLine());
+        bottom.addView(position, new LinearLayout.LayoutParams(-2, -1)); root.addView(bottom, lp(-1, 48));
+        root.addView(buildSymbolBar(), lp(-1, 48));
         Ui.install(this, root);
         root.getViewTreeObserver().addOnGlobalLayoutListener(this::updateSymbolBar);
+        updateEditingControls();
         editor.subscribeEvent(ContentChangeEvent.class, (e, unsubscribe) -> {
-            if (!loading && loaded) { dirty = true; details(); scheduleCheckpoint(); }
+            if (loading) return;
+            session.contentRevision++;
+            if (loaded) {
+                dirty = true; details();
+                // Public Sora APIs can bypass editable. Keep the latest body even if this Activity rotates mid-save.
+                if (saving || session.saving) checkpoint(true); else scheduleCheckpoint();
+            }
         });
         editor.subscribeEvent(SelectionChangeEvent.class, (e, unsubscribe) -> { updatePosition(); updateMatchCount(); });
         editor.subscribeEvent(PublishSearchResultEvent.class, (e, unsubscribe) -> updateMatchCount());
@@ -161,7 +172,7 @@ public class EditorActivity extends LabActivity {
         dirty = true; reading = false;
         loading = true; editor.setText(state.content().copyTextShallow(true), true, null); loading = false;
         classifyControls(editor.getText().toString());
-        loaded = true; editor.setEditable(false); details(); updatePosition(); updateSymbolBar();
+        loaded = true; updateEditingControls(); details(); updatePosition();
         new AlertDialog.Builder(this).setTitle("原文件暂时无法访问")
                 .setMessage(blockedSave + "。\n" + (reason.getMessage() == null ? reason.getClass().getSimpleName() : reason.getMessage()))
                 .setPositiveButton("知道了", null).show();
@@ -189,20 +200,7 @@ public class EditorActivity extends LabActivity {
         });
     }
     private void own(File file) { session.own(file); }
-    private String fingerprint() throws IOException {
-        FileStore.Node node = source;
-        while (node.container != null) node = node.container;
-        if (node.file != null) {
-            if (node.root) return FileStore.shell("/system/bin/toybox stat -L -c '%d:%i:%s:%Y' -- "
-                    + FileStore.quote(node.path()), true).trim();
-            try {
-                android.system.StructStat stat = android.system.Os.stat(node.path());
-                return stat.st_dev + ":" + stat.st_ino + ":" + stat.st_size + ":" + stat.st_mtime;
-            } catch (android.system.ErrnoException error) { throw new IOException(error); }
-        }
-        FileStore.Node current = store.document(node.uri);
-        return current.size + ":" + current.modified;
-    }
+    private String fingerprint() throws IOException { return store.fingerprint(source); }
     private void prepareArchive() throws IOException {
         if (archive == null) return;
         if (session.archive != null && session.archive.isFile()) { archive = session.archive; return; }
@@ -219,15 +217,21 @@ public class EditorActivity extends LabActivity {
     }
     private void load(String encoding) {
         int token = ++loadGeneration;
-        loaded = false; reading = true; editor.setEditable(false); info.setText("读取中…");
+        loaded = false; reading = true; updateEditingControls(); info.setText("读取中…");
         runEditor(() -> {
             String observed = fingerprint();
+            String workspaceRevision = getIntent().getStringExtra("sourceRevision");
+            if (workspaceRevision != null) {
+                if (session.baseline != null) workspaceRevision = session.baseline;
+                if (!workspaceRevision.equals(observed))
+                    throw new IOException("工作副本对应的原文件已变化，请返回工具页刷新后重新打开");
+            }
             if (session.baseline == null) session.baseline = observed;
             else if (!session.baseline.equals(observed)) blockedSave = "原文件已变化，草稿仅供核对，请重新打开原文件后合并修改";
             prepareArchive();
             if (classEdit()) {
                 boolean draftText = pendingDraft != null && pendingDraft.metadata().optBoolean("dirty", true);
-                if (draftText || preview == null || !preview.isFile()) {
+                if (pendingDraft != null || preview == null || !preview.isFile()) {
                     File rebuilt = File.createTempFile("editor-class-", ".smali", getCacheDir()); own(rebuilt);
                     if (draftText) Files.write(rebuilt.toPath(), pendingDraft.content().toString().getBytes(StandardCharsets.UTF_8));
                     else ApkTools.disassembleClass(archive, Objects.toString(getIntent().getStringExtra("dexEntry"), ""),
@@ -237,6 +241,7 @@ public class EditorActivity extends LabActivity {
             }
             transcodedPages = false;
             byte[] bytes = readContent();
+            if (!observed.equals(fingerprint())) throw new IOException("读取期间原文件已变化，请重新打开");
             boolean structured = mode != null && (mode.startsWith("arsc") || mode.equals("xml") || classEdit());
             if (structured && bytes.length > STRUCTURED_LIMIT) throw new IOException("结构化编辑内容超过 32 MiB");
             boolean large = bytes.length > LIMIT && !structured;
@@ -253,6 +258,8 @@ public class EditorActivity extends LabActivity {
         }, result -> {
             if (token != loadGeneration) return;
             reading = false;
+            if (getIntent().hasExtra("sourceRevision") && blockedSave == null)
+                getIntent().putExtra("sourceRevision", session.baseline);
             TextCodec.Decoded decoded = result.decoded();
             charset = decoded.charset(); bom = decoded.bom(); paged = result.paged(); uncertainEncoding = decoded.uncertain();
             classifyControls(decoded.text());
@@ -296,7 +303,7 @@ public class EditorActivity extends LabActivity {
             if (pendingDraft != null) { blockedSave = "原文件分段已变化，草稿已保留"; completeLoad(); }
             return;
         }
-        offset = position; loaded = false; reading = true; editor.setEditable(false);
+        offset = position; loaded = false; reading = true; updateEditingControls();
         runEditor(() -> {
             PagedTextFile.Page result = PagedTextFile.read(pageFile, position,
                     transcodedPages ? StandardCharsets.UTF_8 : charset, transcodedPages ? new byte[0] : bom, PAGE);
@@ -346,7 +353,7 @@ public class EditorActivity extends LabActivity {
                 editor.invalidate();
             });
         }
-        loaded = true; editor.setEditable((preview == null && !readOnly) || classEdit()); details();
+        loaded = true; updateEditingControls(); details();
         updatePosition(); updateSymbolBar(); runSearch();
         if (blockedSave != null) new AlertDialog.Builder(this).setTitle("草稿需要核对")
                 .setMessage(blockedSave + "。不会自动覆盖原文件。")
@@ -361,7 +368,7 @@ public class EditorActivity extends LabActivity {
     }
     private void checkpoint(boolean persist) {
         handler.removeCallbacks(draftCheckpoint); checkpointStarted = 0;
-        if (!loaded || reading || saving || session.saving || source == null || readOnly
+        if (!loaded || reading || source == null || readOnly
                 || preview != null && !classEdit() || session.document == null) return;
         try {
             JSONObject data = new JSONObject().put("time", System.currentTimeMillis()).put("dirty", dirty)
@@ -398,9 +405,10 @@ public class EditorActivity extends LabActivity {
         };
         if (dirty) new AlertDialog.Builder(this).setTitle("当前分段尚未保存")
                 .setNegativeButton("继续编辑", null).setPositiveButton("放弃修改", (d, w) -> {
+                    if (saving || session.saving) { afterSave = () -> changePage(next); return; }
                     dirty = false; handler.removeCallbacks(draftCheckpoint); session.discard(); navigate.run();
                 })
-                .setNeutralButton("保存并翻页", (d, w) -> save(navigate)).show();
+                .setNeutralButton("保存并翻页", (d, w) -> save(navigate, () -> changePage(next))).show();
         else navigate.run();
     }
     private void details() {
@@ -438,39 +446,60 @@ public class EditorActivity extends LabActivity {
         editor.setEditorLanguage(new CodeLanguage(effective));
     }
     private void save() { save(null); }
-    private void save(Runnable done) {
+    private void save(Runnable done) { save(done, this::leave); }
+    private void save(Runnable done, Runnable changed) {
         if (reviewOnly) { Tasks.toast(this, blockedSave); return; }
-        if (!loaded || ((readOnly || preview != null) && !classEdit()) || saving) {
-            Tasks.toast(this, ((readOnly || preview != null) && !classEdit()) ? "当前为只读预览" : "等待读取完成"); return;
+        if (!loaded || reading || ((readOnly || preview != null) && !classEdit()) || saving || session.saving) {
+            Tasks.toast(this, ((readOnly || preview != null) && !classEdit()) ? "当前为只读预览" : "等待读写完成"); return;
         }
         checkpoint(true);
+        long revision = session.contentRevision;
         String text = editor.getText().toString(); Charset current = charset; byte[] mark = bom;
-        saving = true; session.saving = true; editor.setEditable(false); info.setText("保存中…");
-        runEditor(() -> {
+        saving = true; session.saving = true; updateEditingControls(); info.setText("保存中…");
+        session.begin();
+        Tasks.IO.execute(() -> {
+            String baseline = null; Exception failure = null;
             try {
                 if (blockedSave != null) throw new IOException(blockedSave);
                 store.checkWritable(source);
                 if (!Objects.equals(session.baseline, fingerprint()))
                     throw new IOException("原文件已在外部改变，草稿已保留；请重新打开核对后再保存");
-                writeContent(text, current, mark);
-                long written = savedSize;
-                String baseline = fingerprint(); session.saved(); session.baseline = baseline;
-                return written;
-            } finally { session.saving = false; }
-        }, ok -> {
-            saving = false; dirty = false; editor.setEditable(true);
-            if (ok >= 0) length = ok;
-            details();
-            checkpoint(false); Tasks.toast(this, "已保存"); if (done != null) done.run();
-            Runnable queued = afterSave; afterSave = null;
-            if (queued != null && !isFinishing()) queued.run();
-        }, error -> {
-            afterSave = null;
-            saving = false; editor.setEditable(true); details(); checkpoint(true); Tasks.showError(this, error);
+                baseline = writeContent(text, current, mark);
+            } catch (Exception error) { failure = error; }
+            String published = baseline; Exception error = failure; long written = savedSize;
+            // Unlike ordinary load callbacks, finalization must survive onDestroy's handler cleanup.
+            // The recreated Activity waits on session.saving until baseline AND draft metadata agree.
+            new Handler(Looper.getMainLooper()).post(() -> completeSave(revision, published, written, error, done, changed));
         });
     }
-    private void writeContent(String text, Charset current, byte[] mark) throws Exception {
+    private void completeSave(long revision, String baseline, long written, Exception error, Runnable done, Runnable changed) {
+        try {
+            boolean clean = false;
+            if (error == null) {
+                if (written >= 0) length = written;
+                try { clean = session.saved(revision, baseline, paged ? length : written, paged ? currentPage : null); }
+                catch (JSONException failure) { error = failure; }
+            }
+            saving = false; session.saving = false;
+            if (isFinishing() || isDestroyed()) return;
+            updateEditingControls();
+            if (getIntent().hasExtra("sourceRevision")) getIntent().putExtra("sourceRevision", session.baseline);
+            if (error != null) {
+                afterSave = null;
+                dirty = true; details(); checkpoint(true); Tasks.showError(this, error); return;
+            }
+            dirty = !clean; details(); checkpoint(!clean);
+            Tasks.toast(this, clean ? "已保存" : "已保存快照；当前修改尚未保存");
+            Runnable queued = afterSave; afterSave = null;
+            if (clean) { if (done != null) done.run(); }
+            else if (done != null && queued == null) changed.run();
+            // These are leave/changePage entry points, not raw finish/page actions: they recheck dirty.
+            if (queued != null && !isFinishing()) queued.run();
+        } finally { session.end(); }
+    }
+    private String writeContent(String text, Charset current, byte[] mark) throws Exception {
         savedSize = -1;
+        String revision = null;
         if (paged) {
             File tmp = File.createTempFile("large-editor-", ".tmp", getCacheDir());
             File encoded = null;
@@ -484,15 +513,15 @@ public class EditorActivity extends LabActivity {
                     payload = encoded;
                 }
                 if (archive != null && entry != null) {
-                    ArchiveOps.rewrite(archive, null, null, Map.of(entry, payload)); store.write(source, archive);
-                } else store.write(source, payload);
+                    ArchiveOps.rewrite(archive, null, null, Map.of(entry, payload)); revision = store.write(source, archive, session.baseline);
+                } else revision = store.write(source, payload, session.baseline);
                 if (!pageFile.equals(source.file) || archive != null) FileStore.replace(tmp, pageFile);
                 currentPage = result; length = pageFile.length();
             } finally {
                 Files.deleteIfExists(tmp.toPath());
                 if (encoded != null) Files.deleteIfExists(encoded.toPath());
             }
-            return;
+            return revision;
         } else if (classEdit()) {
             ApkTools.saveDexClass(archive, getIntent().getStringExtra("dexEntry"),
                     getIntent().getStringExtra("descriptor"), text, getCacheDir());
@@ -501,19 +530,19 @@ public class EditorActivity extends LabActivity {
         else if ("arsc".equals(mode)) ApkTools.saveArsc(archive, entry, text);
         else if ("arsc-file".equals(mode)) {
             File tmp = File.createTempFile("resources-", ".arsc", getCacheDir());
-            try { ApkTools.saveArscFile(tmp, text); store.write(source, tmp); }
+            try { ApkTools.saveArscFile(tmp, text); return store.write(source, tmp, session.baseline); }
             finally { Files.deleteIfExists(tmp.toPath()); }
-            return;
         } else {
             byte[] encoded = TextCodec.encode(text, current, mark);
             File tmp = File.createTempFile("editor-", ".tmp", getCacheDir());
             try {
                 Files.write(tmp.toPath(), encoded);
                 if (archive != null && entry != null) ArchiveOps.rewrite(archive, null, null, Map.of(entry, tmp));
-                else { store.write(source, tmp); savedSize = encoded.length; }
+                else { revision = store.write(source, tmp, session.baseline); savedSize = encoded.length; }
             } finally { Files.deleteIfExists(tmp.toPath()); }
         }
-        if (archive != null) store.write(source, archive);
+        if (archive != null) return store.write(source, archive, session.baseline);
+        return revision;
     }
     private View buildSearchBar() {
         searchBar = Ui.column(this); searchBar.setBackgroundColor(Ui.PANEL); searchBar.setVisibility(View.GONE);
@@ -522,25 +551,25 @@ public class EditorActivity extends LabActivity {
         findInput = searchInput("查找"); findInput.setContentDescription("查找内容");
         findInput.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH);
         findInput.setOnEditorActionListener((v, action, event) -> { jumpMatch(true); return true; });
-        findRow.addView(findInput, new LinearLayout.LayoutParams(0, Ui.dp(this, 40), 1));
+        findRow.addView(findInput, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
         matchCount = Ui.single(this, "", 11, Ui.MUTED); matchCount.setGravity(android.view.Gravity.CENTER);
-        findRow.addView(matchCount, lp(56, 40));
+        findRow.addView(matchCount, lp(56, 48));
         View previous = Ui.icon(this, R.drawable.ic_up, "上一处", Ui.TEXT, () -> jumpMatch(false));
-        findRow.addView(previous, lp(40, 40));
+        findRow.addView(previous, lp(48, 48));
         View next = Ui.icon(this, R.drawable.ic_up, "下一处", Ui.TEXT, () -> jumpMatch(true));
-        next.setRotation(180); findRow.addView(next, lp(40, 40));
+        next.setRotation(180); findRow.addView(next, lp(48, 48));
         TextView close = Ui.text(this, "×", 22, Ui.MUTED); close.setGravity(android.view.Gravity.CENTER);
         close.setContentDescription("关闭查找"); close.setBackground(Ui.ripple(Ui.PANEL));
-        close.setOnClickListener(v -> closeSearch()); findRow.addView(close, lp(36, 40));
+        close.setOnClickListener(v -> closeSearch()); findRow.addView(close, lp(48, 48));
         searchBar.addView(findRow);
         replaceRow = Ui.row(this);
         replaceInput = searchInput("替换为"); replaceInput.setContentDescription("替换内容");
-        replaceRow.addView(replaceInput, new LinearLayout.LayoutParams(0, Ui.dp(this, 40), 1));
+        replaceRow.addView(replaceInput, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
         regexToggle = toggle(".*", "正则表达式", () -> regexSearch = !regexSearch);
         caseToggle = toggle("Aa", "区分大小写", () -> caseSensitive = !caseSensitive);
-        replaceRow.addView(regexToggle, lp(36, 40)); replaceRow.addView(caseToggle, lp(36, 40));
-        replaceRow.addView(searchAction("替换", this::replaceOne), lp(-2, 40));
-        replaceRow.addView(searchAction("全部替换", this::replaceAll), lp(-2, 40));
+        replaceRow.addView(regexToggle, lp(48, 48)); replaceRow.addView(caseToggle, lp(48, 48));
+        replaceRow.addView(searchAction("替换", this::replaceOne), lp(-2, 48));
+        replaceRow.addView(searchAction("全部替换", this::replaceAll), lp(-2, 48));
         searchBar.addView(replaceRow);
         MainActivity.watch(findInput, this::runSearch);
         View.OnFocusChangeListener focus = (v, has) -> updateSymbolBar();
@@ -571,7 +600,8 @@ public class EditorActivity extends LabActivity {
     private TextView searchAction(String label, Runnable action) {
         TextView button = Ui.text(this, label, 13, Ui.ACCENT); button.setGravity(android.view.Gravity.CENTER);
         button.setPadding(Ui.dp(this, 10), 0, Ui.dp(this, 10), 0); button.setBackground(Ui.ripple(Ui.PANEL));
-        button.setOnClickListener(v -> action.run());
+        button.setMinimumWidth(Ui.dp(this, 48)); button.setMinimumHeight(Ui.dp(this, 48)); button.setFocusable(true);
+        button.setOnClickListener(v -> action.run()); bodyControls.add(button);
         return button;
     }
     private void openSearch() {
@@ -584,8 +614,8 @@ public class EditorActivity extends LabActivity {
             findInput.setText(editor.getText().subSequence(cursor.getLeft(), cursor.getRight()));
         searchBar.setVisibility(View.VISIBLE);
         searchBar.animate().cancel(); searchBar.setAlpha(.4f); searchBar.setTranslationY(-Ui.dp(this, 8));
-        searchBar.animate().alpha(1f).translationY(0).setDuration(Ui.MOTION_SHORT)
-                .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+        searchBar.animate().alpha(1f).translationY(0).setDuration(Ui.motionEnabled() ? Ui.MOTION_SHORT : 0)
+                .setInterpolator(Ui.EASING).start();
         findInput.requestFocus(); findInput.selectAll();
         ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
                 .showSoftInput(findInput, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
@@ -632,8 +662,22 @@ public class EditorActivity extends LabActivity {
         updateMatchCount();
     }
     private boolean canReplace() { return !reviewOnly && !readOnly && (preview == null || classEdit()); }
+    private boolean canMutateBody() {
+        return loaded && !loading && !reading && !saving && !session.saving && canReplace() && editor.isEditable();
+    }
+    private void updateEditingControls() {
+        boolean editable = loaded && !loading && !reading && !saving && !session.saving && canReplace();
+        editor.setEditable(editable);
+        for (View control : bodyControls) control.setEnabled(editable);
+        // Page arrows must remain available to queue navigation while a save is in flight.
+        if (undoButton != null) undoButton.setEnabled(paged ? loaded : editable);
+        if (redoButton != null) redoButton.setEnabled(paged ? loaded : editable);
+        updateSymbolBar();
+    }
+    private void undo() { if (canMutateBody()) editor.undo(); }
+    private void redo() { if (canMutateBody()) editor.redo(); }
     private void replaceOne() {
-        if (!canReplace() || !editor.isEditable()) { Tasks.toast(this, "当前不可修改"); return; }
+        if (!canMutateBody()) { Tasks.toast(this, "当前不可修改"); return; }
         EditorSearcher searcher = editor.getSearcher();
         if (!searcher.hasQuery()) return;
         try {
@@ -643,7 +687,7 @@ public class EditorActivity extends LabActivity {
         updateMatchCount();
     }
     private void replaceAll() {
-        if (!canReplace() || !editor.isEditable()) { Tasks.toast(this, "当前不可修改"); return; }
+        if (!canMutateBody()) { Tasks.toast(this, "当前不可修改"); return; }
         if (!editor.getSearcher().hasQuery()) return;
         try { editor.getSearcher().replaceAll(replaceInput.getText().toString()); }
         catch (RuntimeException error) { Tasks.toast(this, error.getMessage() == null ? "正在查找，请稍候" : error.getMessage()); }
@@ -658,8 +702,8 @@ public class EditorActivity extends LabActivity {
             TextView key = Ui.text(this, symbol, symbol.length() > 1 ? 12 : 16, Ui.TEXT);
             key.setGravity(android.view.Gravity.CENTER); key.setTypeface(android.graphics.Typeface.MONOSPACE);
             key.setContentDescription("插入 " + symbol); key.setBackground(Ui.ripple(Ui.PANEL));
-            key.setMinimumWidth(Ui.dp(this, symbol.length() > 1 ? 52 : 40));
-            key.setOnClickListener(v -> insertSymbol(symbol));
+            key.setMinimumWidth(Ui.dp(this, symbol.length() > 1 ? 52 : 48));
+            key.setOnClickListener(v -> insertSymbol(symbol)); bodyControls.add(key);
             symbols.addView(key, new LinearLayout.LayoutParams(-2, -1));
         }
         scroll.addView(symbols, new FrameLayout.LayoutParams(-2, -1));
@@ -667,7 +711,7 @@ public class EditorActivity extends LabActivity {
         return scroll;
     }
     private void insertSymbol(String symbol) {
-        if (!editor.isEditable()) return;
+        if (!canMutateBody()) return;
         if (symbol.equals("Tab")) editor.indentOrCommitTab();
         else editor.insertText(symbol, symbol.length());
     }
@@ -678,7 +722,7 @@ public class EditorActivity extends LabActivity {
             imeVisible = insets != null && insets.isVisible(android.view.WindowInsets.Type.ime());
         }
         boolean searching = findInput.hasFocus() || replaceInput.hasFocus();
-        boolean show = loaded && canReplace() && imeVisible && !searching;
+        boolean show = canMutateBody() && imeVisible && !searching;
         View bar = (View) symbols.getParent();
         int wanted = show ? View.VISIBLE : View.GONE;
         if (bar.getVisibility() != wanted) { bar.setVisibility(wanted); if (show) Ui.fadeIn(bar); }
@@ -744,14 +788,14 @@ public class EditorActivity extends LabActivity {
                     encoding(false);
                 }
                 case 4 -> encoding(true);
-                case 5 -> editor.undo();
-                case 6 -> editor.redo();
+                case 5 -> undo();
+                case 6 -> redo();
                 case 7 -> save();
             }
         }).show();
     }
     private void encoding(boolean convert) {
-        if (reading || saving) { Tasks.toast(this, "等待读写完成"); return; }
+        if (reading || saving || session.saving || convert && !canMutateBody()) { Tasks.toast(this, "等待读写完成或当前不可修改"); return; }
         if (convert && paged) { Tasks.toast(this, "大文件分段编辑保留原编码"); return; }
         String[] choices = {"自动识别", "UTF-8", "UTF-16LE", "UTF-16BE", "UTF-32LE", "UTF-32BE",
                 "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR", "ISO-2022-JP",
@@ -759,8 +803,12 @@ public class EditorActivity extends LabActivity {
         if (convert) choices = Arrays.copyOfRange(choices, 1, choices.length);
         String[] encodings = choices;
         new AlertDialog.Builder(this).setTitle(convert ? "保存编码" : "读取编码").setItems(choices, (d, n) -> {
-            if (convert) { charset = Charset.forName(encodings[n]); bom = new byte[0]; uncertainEncoding = false; dirty = true; details(); scheduleCheckpoint(); }
-                else load(n == 0 ? null : encodings[n]);
+            // A chooser opened before save must not change encoding/reload the body after snapshot capture.
+            if (reading || saving || session.saving || convert && !canMutateBody()) { Tasks.toast(this, "等待读写完成或当前不可修改"); return; }
+            if (convert) {
+                charset = Charset.forName(encodings[n]); bom = new byte[0]; uncertainEncoding = false;
+                session.contentRevision++; dirty = true; details(); scheduleCheckpoint();
+            } else load(n == 0 ? null : encodings[n]);
         }).show();
     }
     private void leave() {
@@ -768,6 +816,7 @@ public class EditorActivity extends LabActivity {
         if (reviewOnly) { finish(); return; }
         if (dirty) new AlertDialog.Builder(this).setTitle("修改尚未保存").setNegativeButton("继续编辑", null)
                 .setPositiveButton("放弃修改", (d, w) -> {
+                    if (saving || session.saving) { afterSave = this::leave; return; }
                     dirty = false; handler.removeCallbacks(draftCheckpoint); session.discard(); finish();
                 }).setNeutralButton("保存", (d, w) -> save(this::finish)).show();
         else finish();
@@ -796,7 +845,10 @@ public class EditorActivity extends LabActivity {
         colors.setColor(EditorColorScheme.COMMENT, Ui.MUTED); editor.invalidate();
     }
     @Override protected void onSaveInstanceState(Bundle out) {
-        checkpoint(true); out.putString("editorSession", session.drafts.id); super.onSaveInstanceState(out);
+        checkpoint(true); out.putString("editorSession", session.drafts.id);
+        if (getIntent().hasExtra("sourceRevision")) out.putString("sourceRevision",
+                session.baseline != null ? session.baseline : getIntent().getStringExtra("sourceRevision"));
+        super.onSaveInstanceState(out);
     }
     @Override protected void onPause() { checkpoint(true); saveTextSize(); super.onPause(); }
     @Override protected void onStop() { checkpoint(true); super.onStop(); }

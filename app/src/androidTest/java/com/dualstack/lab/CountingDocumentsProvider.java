@@ -37,9 +37,22 @@ public class CountingDocumentsProvider extends DocumentsProvider {
         }
     }
     private File root;
-    private int childQueries, createCalls, deleteCalls;
+    private int childQueries, createCalls, deleteCalls, readOpens, writeOpens;
     private String failCreateName, failReadName, renameName, collideName, blockReadName, failDeleteName;
+    private String failReadAfterPrefixName, truncateWriteName, corruptWriteName, corruptOnNextRead;
+    private int writeTruncateBytes = 3;
     private ReadGate readGate;
+    private String blockDeleteName;
+    private String alternateReadName;
+    private int alternateReadAt = 2, alternateReadHits;
+    private DeleteGate deleteGate;
+    private static final class DeleteGate {
+        final CountDownLatch released = new CountDownLatch(1);
+        final String documentId;
+        volatile boolean completed, reset;
+        volatile String error;
+        DeleteGate(String documentId) { this.documentId = documentId; }
+    }
     private static final class ReadGate {
         final CountDownLatch released = new CountDownLatch(1);
         volatile boolean prefixWritten;
@@ -98,8 +111,34 @@ public class CountingDocumentsProvider extends DocumentsProvider {
     @Override public synchronized ParcelFileDescriptor openDocument(String documentId, String mode,
                                                                     CancellationSignal signal) throws FileNotFoundException {
         File file = resolve(documentId);
+        if (mode.equals("r")) readOpens++; else writeOpens++;
+        if (mode.equals("r") && file.getName().equals(alternateReadName) && ++alternateReadHits == alternateReadAt) {
+            try {
+                byte[] bytes = Files.readAllBytes(file.toPath()); if (bytes.length > 0) bytes[0] ^= 1;
+                ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+                Thread writer = new Thread(() -> {
+                    try (OutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) { out.write(bytes); }
+                    catch (IOException ignored) { }
+                }, "alternate-read-fixture"); writer.setDaemon(true); writer.start(); return pipe[0];
+            } catch (IOException error) { throw failure(error); }
+        }
+        if (!mode.equals("r") && file.getName().equals(truncateWriteName)) {
+            // Synchronous mutation followed by a synchronous Binder error: never depend on pipe-close timing.
+            try (RandomAccessFile output = new RandomAccessFile(file, "rw")) {
+                output.setLength(Math.min(file.length(), writeTruncateBytes)); output.getFD().sync();
+            } catch (IOException error) { throw failure(error); }
+            throw new FileNotFoundException("Injected write failure after synchronous truncation");
+        }
+        if (mode.equals("r") && file.getName().equals(corruptOnNextRead)) {
+            corruptOnNextRead = null;
+            try (RandomAccessFile output = new RandomAccessFile(file, "rw")) {
+                int first = output.read(); output.seek(0); output.write(first < 0 ? 1 : first ^ 1); output.getFD().sync();
+            } catch (IOException error) { throw failure(error); }
+        }
+        if (!mode.equals("r") && file.getName().equals(corruptWriteName)) corruptOnNextRead = file.getName();
         if (mode.equals("r") && file.getName().equals(failReadName))
             throw new FileNotFoundException("Injected read failure");
+        if (mode.equals("r") && file.getName().equals(failReadAfterPrefixName)) return failedReadPipe(file);
         if (mode.equals("r") && file.getName().equals(blockReadName)) {
             blockReadName = null;
             try {
@@ -122,11 +161,49 @@ public class CountingDocumentsProvider extends DocumentsProvider {
         }
         return ParcelFileDescriptor.open(file, ParcelFileDescriptor.parseMode(mode));
     }
-    @Override public synchronized void deleteDocument(String documentId) throws FileNotFoundException {
-        File file = resolve(documentId); deleteCalls++;
-        if (file.getName().equals(failDeleteName)) throw new SecurityException("Injected delete failure");
-        if (file.equals(root)) throw new FileNotFoundException("Cannot delete fixture root");
-        try { remove(file); } catch (IOException error) { throw failure(error); }
+    private static ParcelFileDescriptor failedReadPipe(File file) throws FileNotFoundException {
+        ParcelFileDescriptor[] pipe = null;
+        try {
+            pipe = ParcelFileDescriptor.createReliablePipe();
+            // Less than PIPE_BUF, so no reader thread or asynchronous close notification is necessary.
+            byte[] prefix = new byte[257]; int count;
+            try (InputStream input = new FileInputStream(file)) { count = input.read(prefix); }
+            if (count > 0) android.system.Os.write(pipe[1].getFileDescriptor(), prefix, 0, count);
+            pipe[1].closeWithError("Injected mid-read failure after prefix");
+            return pipe[0];
+        } catch (android.system.ErrnoException | IOException error) {
+            if (pipe != null) for (ParcelFileDescriptor descriptor : pipe)
+                try { descriptor.close(); } catch (IOException ignored) { }
+            throw failure(new IOException(error));
+        }
+    }
+    @Override public void deleteDocument(String documentId) throws FileNotFoundException {
+        File file;
+        DeleteGate gate;
+        synchronized (this) {
+            file = resolve(documentId); deleteCalls++;
+            if (file.getName().equals(failDeleteName)) throw new SecurityException("Injected delete failure");
+            if (file.equals(root)) throw new FileNotFoundException("Cannot delete fixture root");
+            if (!file.getName().equals(blockDeleteName)) {
+                try { remove(file); } catch (IOException error) { throw failure(error); }
+                return;
+            }
+            blockDeleteName = null;
+            gate = new DeleteGate(documentId); deleteGate = gate;
+        }
+        // Never wait under the provider monitor: deleteState/releaseDelete/reset use that monitor.
+        try {
+            if (!gate.released.await(60, TimeUnit.SECONDS)) throw new IOException("Blocked fixture delete timed out");
+        } catch (IOException error) { gate.error = error.toString(); throw failure(error); }
+        catch (InterruptedException error) {
+            gate.error = error.toString(); Thread.currentThread().interrupt(); throw failure(new IOException(error));
+        }
+        synchronized (this) {
+            // A reset releases waiters but must not let an old request delete freshly seeded data.
+            if (gate.reset) throw new FileNotFoundException("Blocked fixture delete was reset");
+            try { remove(file); gate.completed = true; }
+            catch (IOException error) { gate.error = error.toString(); throw failure(error); }
+        }
     }
     @Override public synchronized boolean isChildDocument(String parentDocumentId, String documentId) {
         try {
@@ -134,46 +211,73 @@ public class CountingDocumentsProvider extends DocumentsProvider {
             return !parent.equals(child) && child.toPath().startsWith(parent.toPath());
         } catch (FileNotFoundException error) { return false; }
     }
-    @Override public synchronized Bundle call(String method, String argument, Bundle extras) {
+    @Override public Bundle call(String method, String argument, Bundle extras) {
+        // DocumentsProvider routes android:deleteDocument back into deleteDocument. Do not retain
+        // this monitor across that dispatch, or even an out-of-monitor gate would deadlock controls.
         if (method.startsWith("android:")) return super.call(method, argument, extras);
+        return control(method, extras);
+    }
+    private synchronized Bundle control(String method, Bundle extras) {
         Bundle result = new Bundle();
         try {
             switch (method) {
                 case "reset" -> {
                     if (readGate != null) readGate.released.countDown();
                     readGate = null;
+                    if (deleteGate != null) { deleteGate.reset = true; deleteGate.released.countDown(); }
+                    deleteGate = null; blockDeleteName = null;
                     File[] files = root.listFiles();
                     if (files == null) throw new IOException("Fixture root is unavailable");
                     for (File file : files) remove(file);
-                    childQueries = createCalls = deleteCalls = 0;
+                    childQueries = createCalls = deleteCalls = readOpens = writeOpens = 0;
                     failCreateName = failReadName = renameName = collideName = blockReadName = failDeleteName = null;
+                    failReadAfterPrefixName = truncateWriteName = corruptWriteName = corruptOnNextRead = null;
+                    writeTruncateBytes = 3;
+                    alternateReadName = null; alternateReadAt = 2; alternateReadHits = 0;
                     Uri tree = DocumentsContract.buildTreeDocumentUri(AUTHORITY, "root");
                     getContext().grantUriPermission("com.dualstack.lab", tree,
                             Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                                     | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
                     result.putString("uri", DocumentsContract.buildDocumentUriUsingTree(tree, "root").toString());
                 }
-                case "clearCounters" -> { childQueries = createCalls = deleteCalls = 0; }
+                case "clearCounters" -> { childQueries = createCalls = deleteCalls = readOpens = writeOpens = 0; }
                 case "readState" -> {
                     result.putBoolean("opened", readGate != null);
                     result.putBoolean("prefixWritten", readGate != null && readGate.prefixWritten);
                     result.putString("error", readGate == null ? null : readGate.error);
                 }
                 case "releaseRead" -> { if (readGate != null) readGate.released.countDown(); }
+                case "deleteState" -> {
+                    result.putBoolean("opened", deleteGate != null);
+                    result.putBoolean("released", deleteGate != null && deleteGate.released.getCount() == 0);
+                    result.putBoolean("completed", deleteGate != null && deleteGate.completed);
+                    result.putString("documentId", deleteGate == null ? null : deleteGate.documentId);
+                    result.putString("error", deleteGate == null ? null : deleteGate.error);
+                }
+                case "releaseDelete" -> { if (deleteGate != null) deleteGate.released.countDown(); }
                 case "configure" -> {
+                    alternateReadName = extras.getString("alternateReadName"); alternateReadAt = extras.getInt("alternateReadAt", 2); alternateReadHits = 0;
                     failCreateName = extras.getString("failCreateName");
                     failReadName = extras.getString("failReadName");
                     renameName = extras.getString("renameName"); collideName = extras.getString("collideName");
                     blockReadName = extras.getString("blockReadName"); failDeleteName = extras.getString("failDeleteName");
+                    blockDeleteName = extras.getString("blockDeleteName");
+                    failReadAfterPrefixName = extras.getString("failReadAfterPrefixName");
+                    truncateWriteName = extras.getString("truncateWriteName");
+                    writeTruncateBytes = Math.max(0, extras.getInt("writeTruncateBytes", 3));
+                    corruptWriteName = extras.getString("corruptWriteName"); corruptOnNextRead = null;
                 }
                 case "seed" -> {
                     File parent = resolve(extras.getString("parent", "root"));
                     String name = extras.getString("name"); checkName(name);
-                    result.putString("id", id(create(parent, name, extras.getBoolean("directory"), extras.getString("text", ""))));
+                    File seeded = create(parent, name, extras.getBoolean("directory"), extras.getString("text", ""));
+                    if (extras.containsKey("bytes") && !seeded.isDirectory()) Files.write(seeded.toPath(), extras.getByteArray("bytes"));
+                    result.putString("id", id(seeded));
                 }
                 case "stats" -> {
                     result.putInt("childQueries", childQueries); result.putInt("createCalls", createCalls);
                     result.putInt("deleteCalls", deleteCalls);
+                    result.putInt("readOpens", readOpens); result.putInt("writeOpens", writeOpens);
                     ArrayList<String> paths = new ArrayList<>(); collect(root, paths);
                     Collections.sort(paths); result.putStringArrayList("paths", paths);
                 }

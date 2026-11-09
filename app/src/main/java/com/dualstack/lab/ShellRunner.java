@@ -56,10 +56,17 @@ final class ShellRunner {
             if (stopped) stop();
             if (stdin != null) {
                 // Pump separately: a command that writes more than the pipe buffer would otherwise deadlock.
-                Thread feeder = new Thread(() -> {
+                Thread feeder = new Thread(Tasks.Progress.bind(() -> {
                     try (OutputStream out = process.getOutputStream(); InputStream source = stdin) { FileStore.pump(source, out); }
-                    catch (IOException failure) { outputFailure.compareAndSet(null, failure); stop(); }
-                }, "shell-input");
+                    catch (IOException failure) {
+                        outputFailure.compareAndSet(null, failure);
+                        if (failure instanceof Tasks.CancelledException) {
+                            // EOF lets transactional readers reject a short payload and run their finally cleanup.
+                            try { if (!process.waitFor(5, TimeUnit.SECONDS)) stop(); }
+                            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); stop(); }
+                        } else stop();
+                    }
+                }), "shell-input");
                 feeder.setDaemon(true); feeder.start();
             } else if (!interactive) process.getOutputStream().close();
             Thread reader = new Thread(() -> {

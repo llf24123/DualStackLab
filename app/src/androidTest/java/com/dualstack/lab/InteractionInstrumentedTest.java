@@ -264,7 +264,8 @@ public class InteractionInstrumentedTest {
     }
     @Test public void shortOrSlantedStrokesDoNotStartSelection() throws Exception {
         for (int i = 0; i < 30; i++) Files.write(new File(left, String.format(java.util.Locale.ROOT, "row-%02d.txt", i)).toPath(), new byte[]{65});
-        main(); find(By.text("row-05.txt"));
+        main(); scenario.onActivity(activity -> activity.setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT));
+        find(By.text("row-05.txt"));
         android.graphics.Rect bounds = find(By.desc("左窗口文件列表")).getVisibleBounds();
         int y = find(By.text("row-05.txt")).getVisibleBounds().centerY(), x = bounds.left + bounds.width() / 3;
         assertTrue("Short sideways nudge", device.swipe(x, y, x + Ui.dp(context, 30), y, 12));

@@ -85,8 +85,8 @@ public class TerminalActivity extends LabActivity {
         key(second, "▼", "终端向下", KeyEvent.KEYCODE_DPAD_DOWN);
         key(second, "▶", "终端向右", KeyEvent.KEYCODE_DPAD_RIGHT);
         button(second, "IM", "终端输入法", this::showKeyboard);
-        body.addView(first, new LinearLayout.LayoutParams(-1, keyHeight()));
-        body.addView(second, new LinearLayout.LayoutParams(-1, keyHeight()));
+        body.addView(keyScroll(first), new LinearLayout.LayoutParams(-1, keyHeight()));
+        body.addView(keyScroll(second), new LinearLayout.LayoutParams(-1, keyHeight()));
         Ui.install(this, body);
         body.setBackgroundColor(Color.BLACK);
         body.getChildAt(0).setBackgroundColor(Color.BLACK);
@@ -124,12 +124,18 @@ public class TerminalActivity extends LabActivity {
     }
     @Override protected void onPaletteChanged() { blackBars(); }
     private int keyHeight() {
-        return Ui.dp(this, getResources().getConfiguration().orientation
-                == android.content.res.Configuration.ORIENTATION_LANDSCAPE ? 36 : 48);
+        return Ui.dp(this, 48);
+    }
+    private android.widget.HorizontalScrollView keyScroll(LinearLayout keys) {
+        android.widget.HorizontalScrollView scroll = new android.widget.HorizontalScrollView(this);
+        scroll.setHorizontalScrollBarEnabled(false);
+        scroll.addView(keys, new android.widget.FrameLayout.LayoutParams(Math.max(Ui.dp(this, 7 * 48), getResources().getDisplayMetrics().widthPixels), keyHeight()));
+        return scroll;
     }
     @Override public void onConfigurationChanged(android.content.res.Configuration configuration) {
         super.onConfigurationChanged(configuration);
         firstKeys.getLayoutParams().height = secondKeys.getLayoutParams().height = keyHeight();
+        firstKeys.getLayoutParams().width = secondKeys.getLayoutParams().width = Math.max(Ui.dp(this, 7 * 48), getResources().getDisplayMetrics().widthPixels);
         firstKeys.requestLayout(); secondKeys.requestLayout();
     }
     private void showKeyboard() {
@@ -144,18 +150,15 @@ public class TerminalActivity extends LabActivity {
             if (requestedRoot) RootShell.capabilities();
             ExecutableFile.Prepared file = ExecutableFile.prepare(this, new FileStore(this).fromIntent(getIntent()),
                     getIntent().getBooleanExtra("forceScript", false));
-            boolean available = file.elf() != null && !requestedRoot && rootAvailable();
             synchronized (this) {
                 if (disposed) { file.close(); return null; }
                 prepared = file;
             }
-            return new Launch(file, available);
-        }, launch -> {
-            if (launch == null) return;
-            if (launch.file().elf() != null) {
-                pipe = false;
-                if (!useRoot) useRoot = launch.rootAvailable();
-            }
+            return file;
+        }, file -> {
+            if (file == null) return;
+            // ELF detection changes the input mode, never the caller's execution privilege.
+            if (file.elf() != null) pipe = false;
             preparing = false; runFile();
         }, error -> {
             preparing = false;
@@ -165,13 +168,6 @@ public class TerminalActivity extends LabActivity {
                         if (!isFinishing()) finish();
                     }).show();
         });
-    }
-    private record Launch(ExecutableFile.Prepared file, boolean rootAvailable) {}
-    private boolean rootAvailable() {
-        try {
-            ShellRunner.Result result = new ShellRunner().run("/system/bin/toybox id -u", null, true, 5000, null, false);
-            return result.exitCode() == 0 && result.output().trim().equals("0");
-        } catch (Exception unavailable) { return false; }
     }
     private void runFile() {
         if (preparing || running() || prepared == null) return;

@@ -103,9 +103,28 @@ public class SaveSemanticsInstrumentedTest {
         assertNotEquals(0, shellWrite(target, temporary, "short", 100));
         assertEquals("after", text(target)); assertFalse(temporary.exists());
     }
+    @Test public void writerRefusesPreexistingTemporaryLinksAndPipes() throws Exception {
+        File target = file("target", "before"), victim = file("victim", "untouched");
+        File temporary = new File(work, "pending");
+        String victimMode = FileStore.FileState.read(victim).fingerprint();
+        for (String link : new String[]{victim.getPath(), new File(work, "not-created").getPath(), "/dev/null"}) {
+            Os.symlink(link, temporary.getPath());
+            assertNotEquals(0, shellWrite(target, temporary, "after", 5));
+            assertTrue(Files.isSymbolicLink(temporary.toPath()));
+            assertEquals("before", text(target));
+            assertEquals(victimMode, FileStore.FileState.read(victim).fingerprint());
+            assertFalse(new File(work, "not-created").exists());
+            Files.delete(temporary.toPath());
+        }
+        FileStore.shell("/system/bin/toybox mkfifo " + FileStore.quote(temporary.getPath()), false);
+        assertNotEquals(0, shellWrite(target, temporary, "after", 5));
+        assertEquals("before", text(target));
+        assertTrue(android.system.OsConstants.S_ISFIFO(Os.lstat(temporary.getPath()).st_mode));
+    }
     private int shellWrite(File target, File temporary, String value, int length) throws Exception {
         Process process = new ProcessBuilder("/system/bin/sh", "-c", FileStore.rootWriteCommand(
-                target.getPath(), temporary.getPath(), length)).redirectErrorStream(true).start();
+                InstrumentationRegistry.getInstrumentation().getTargetContext().getApplicationInfo().sourceDir,
+                target.getPath(), temporary.getPath(), length, null)).redirectErrorStream(true).start();
         try (OutputStream output = process.getOutputStream()) { output.write(value.getBytes(StandardCharsets.UTF_8)); }
         catch (IOException earlyExit) { }
         assertTrue(process.waitFor(10, TimeUnit.SECONDS));
