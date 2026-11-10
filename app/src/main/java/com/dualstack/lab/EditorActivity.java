@@ -62,10 +62,13 @@ public class EditorActivity extends LabActivity {
     private boolean classEdit() { return "smali-class".equals(mode); }
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        if (saved != null && saved.getBoolean("savedForCaller")) getIntent().putExtra("savedForCaller", true);
+        if (getIntent().getBooleanExtra("savedForCaller", false)) setResult(RESULT_OK);
         if (saved != null && saved.containsKey("sourceRevision"))
             getIntent().putExtra("sourceRevision", saved.getString("sourceRevision"));
         store = new FileStore(this);
         session = new ViewModelProvider(this).get(EditorSession.class);
+        session.sourceSaved |= getIntent().getBooleanExtra("savedForCaller", false);
         try { session.initialize(getApplicationContext(), saved == null ? null : saved.getString("editorSession")); }
         catch (IOException error) { Tasks.showError(this, error); finish(); return; }
         entry = getIntent().getStringExtra("archiveEntry");
@@ -476,6 +479,7 @@ public class EditorActivity extends LabActivity {
         try {
             boolean clean = false;
             if (error == null) {
+                getIntent().putExtra("savedForCaller", true); setResult(RESULT_OK);
                 if (written >= 0) length = written;
                 try { clean = session.saved(revision, baseline, paged ? length : written, paged ? currentPage : null); }
                 catch (JSONException failure) { error = failure; }
@@ -845,12 +849,17 @@ public class EditorActivity extends LabActivity {
         colors.setColor(EditorColorScheme.COMMENT, Ui.MUTED); editor.invalidate();
     }
     @Override protected void onSaveInstanceState(Bundle out) {
+        out.putBoolean("savedForCaller", session != null && session.sourceSaved);
         checkpoint(true); out.putString("editorSession", session.drafts.id);
         if (getIntent().hasExtra("sourceRevision")) out.putString("sourceRevision",
                 session.baseline != null ? session.baseline : getIntent().getStringExtra("sourceRevision"));
         super.onSaveInstanceState(out);
     }
     @Override protected void onPause() { checkpoint(true); saveTextSize(); super.onPause(); }
+    @Override public void finish() {
+        if (session != null && session.sourceSaved) setResult(RESULT_OK);
+        super.finish();
+    }
     @Override protected void onStop() { checkpoint(true); super.onStop(); }
     @Override public void onDestroy() {
         handler.removeCallbacksAndMessages(null);

@@ -9,6 +9,7 @@ import java.util.concurrent.Executors;
 
 final class Tasks {
     static final ExecutorService IO = Executors.newFixedThreadPool(3);
+    static final ExecutorService FILES = Executors.newSingleThreadExecutor();
     static final ExecutorService BROWSE = Executors.newFixedThreadPool(2);
     static final ExecutorService SHELL = Executors.newCachedThreadPool();
     static final ExecutorService CONTROL = Executors.newCachedThreadPool();
@@ -50,6 +51,21 @@ final class Tasks {
         final java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
         final java.util.concurrent.atomic.AtomicLong transferred = new java.util.concurrent.atomic.AtomicLong();
         volatile String current = "";
+        volatile String phase = "准备";
+        static void phase(String value) {
+            Progress progress = CURRENT.get();
+            if (progress != null) progress.phase = value;
+        }
+        static Phase stage(String value) { return new Phase(value); }
+        static final class Phase implements AutoCloseable {
+            private final Progress progress = CURRENT.get();
+            private final String previous;
+            private Phase(String value) {
+                previous = progress == null ? "" : progress.phase;
+                phase(value);
+            }
+            public void close() { if (progress != null) progress.phase = previous; }
+        }
         static void bytes(long count) {
             Progress progress = CURRENT.get();
             if (progress != null && count > 0) progress.transferred.addAndGet(count);

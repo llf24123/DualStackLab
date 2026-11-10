@@ -10,8 +10,8 @@ android {
         applicationId "com.dualstack.lab"
         minSdk 26
         targetSdk 36
-        versionCode 22
-        versionName "0.6.16"
+        versionCode 27
+        versionName "0.6.21"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -32,7 +32,7 @@ android {
 dependencies {
     implementation "androidx.activity:activity:1.10.1"
     implementation "androidx.swiperefreshlayout:swiperefreshlayout:1.2.0"
-    implementation files("../third_party/termux/terminal-view-8629e632fc-release.aar")
+    implementation project(":terminal-view")
     implementation project(":terminal-emulator")
     implementation "com.github.albfernandez:juniversalchardet:2.5.1"
     implementation "io.github.rosemoe:editor:0.24.6"

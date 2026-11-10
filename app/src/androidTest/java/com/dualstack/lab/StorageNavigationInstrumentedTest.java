@@ -49,6 +49,7 @@ public class StorageNavigationInstrumentedTest {
     }
 
     @Test public void internalStorageParentRowReachesFilesystemRoot() throws Exception {
+        Assume.assumeTrue("Requires readable filesystem root", RootAccess.available() || new File("/").list() != null);
         launch(home.getPath()); ready(true, home);
         up(); ready(true, new File("/storage/emulated"));
         find(By.desc("左窗口文件列表")).findObject(By.text(home.getName())).click(); ready(true, home);
@@ -58,6 +59,7 @@ public class StorageNavigationInstrumentedTest {
     }
 
     @Test public void systemBackClimbsAboveStorageThenNeedsTwoActionsAtRoot() throws Exception {
+        Assume.assumeTrue("Requires readable filesystem root", RootAccess.available() || new File("/").list() != null);
         launch(home.getPath()); ready(true, home);
         for (String path : new String[]{"/storage/emulated", "/storage", "/"}) { device.pressBack(); ready(true, new File(path)); }
         device.pressBack();
@@ -100,6 +102,7 @@ public class StorageNavigationInstrumentedTest {
     }
 
     @Test public void rapidUpWithQueuedLoadsStopsAtFilesystemRoot() throws Exception {
+        Assume.assumeTrue("Requires readable filesystem root", RootAccess.available() || new File("/").list() != null);
         launch(home.getPath()); ready(true, home); ready(false, work);
         CountDownLatch occupied = new CountDownLatch(3), release = new CountDownLatch(1);
         for (int i = 0; i < 3; i++) Tasks.IO.execute(() -> {
@@ -121,7 +124,7 @@ public class StorageNavigationInstrumentedTest {
     }
 
     @Test public void automaticRootReturnContinuesAboveSharedHome() throws Exception {
-        assertEquals("0", FileStore.shell("id -u", true).trim());
+        Assume.assumeTrue("Requires a granted su binary", RootAccess.available());
         launch(new File(home, "Android/data").getPath());
         ready(true, new File(home, "Android/data"));
         scenario.onActivity(activity -> assertTrue(node(pane(activity, true)).root));
@@ -133,7 +136,7 @@ public class StorageNavigationInstrumentedTest {
     }
 
     @Test public void explicitRootContainerRemainsBrowsable() throws Exception {
-        assertEquals("0", FileStore.shell("id -u", true).trim());
+        Assume.assumeTrue("Requires a granted su binary", RootAccess.available());
         context.getSharedPreferences("MainActivity", 0).edit()
                 .putString("left", "root:/storage/emulated").commit();
         launch(null); ready(true, new File("/storage/emulated"));
@@ -188,6 +191,30 @@ public class StorageNavigationInstrumentedTest {
         scenario.onActivity(activity -> activity.onNewIntent(
                 new Intent(activity, MainActivity.class).putExtra("navigatePath", home.getPath())));
         ready(true, home);
+    }
+
+    @Test public void typedMissingDirectoryFallsBackToItsParent() throws Exception {
+        File parent = new File(work, "parent"); assertTrue(parent.mkdir());
+        Files.write(new File(parent, "visible.txt").toPath(), new byte[]{65});
+        launch(work.getPath()); ready(true, work);
+        typedJump(new File(parent, "missing").getPath()); ready(true, parent);
+        find(By.text("visible.txt"));
+    }
+    @Test public void typedMissingAncestorsClimbToExistingDirectory() throws Exception {
+        launch(home.getPath()); ready(true, home);
+        Files.write(new File(work, "anchor.txt").toPath(), new byte[]{65});
+        typedJump(new File(work, "missing/deeper/path").getPath()); ready(true, work);
+    }
+    @Test public void typedRegularFileUsesParentAndExistingDirectoryOpensNormally() throws Exception {
+        File file = new File(work, "file.txt"); Files.write(file.toPath(), new byte[]{65});
+        launch(home.getPath()); ready(true, home);
+        typedJump(file.getPath()); ready(true, work);
+        typedJump(home.getPath()); ready(true, home);
+    }
+    private void typedJump(String path) {
+        find(By.desc("路径跳转")).click();
+        find(By.desc("跳转路径")).setText(path);
+        find(By.text("确定")).click();
     }
 
     /** Saved keys drop the ROOT mark; older builds may still carry it. */

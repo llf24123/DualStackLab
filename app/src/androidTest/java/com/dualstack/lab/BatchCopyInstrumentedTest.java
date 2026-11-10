@@ -63,6 +63,64 @@ public class BatchCopyInstrumentedTest {
             assertTrue(inputs.get(i).file.exists());
         }
     }
+    @Test public void providerArchiveBatchReusesOneVerifiedSourceSnapshot() throws Exception {
+        List<FileStore.Node> inputs = new ArrayList<>();
+        for (int i = 0; i < 20; i++) inputs.add(FileStore.local(file(work, "source-" + i, "payload-" + i)));
+        File input = new File(work, "input.zip"), output = new File(work, "output.zip");
+        ArchiveOps.pack(store, inputs, input);
+        ArchiveOps.pack(store, Collections.emptyList(), output);
+        Bundle seed = new Bundle(); seed.putString("name", "input.zip"); seed.putByteArray("bytes", Files.readAllBytes(input.toPath()));
+        call("seed", seed);
+        FileStore.Node source = store.list(documents).get(0);
+        List<FileStore.Node> members = new ArrayList<>();
+        for (int i = 0; i < 20; i++) members.add(FileStore.archiveNode(source, "source-" + i, false, 0, 0));
+        call("clearCounters", null);
+        store.copyAll(members, FileStore.archiveNode(FileStore.local(output), "", true, 0, 0), false);
+        assertTrue("Provider archive was re-read per member", call("stats", null).getInt("readOpens") <= 5);
+        assertEquals(20, ArchiveOps.entryNames(output).size());
+        assertEquals("payload-19", new String(ArchiveOps.bytes(output, "source-19", 100), StandardCharsets.UTF_8));
+    }
+    @Test public void providerArchiveToFolderReusesOneContainerRead() throws Exception {
+        File archive = new File(work, "read-batch.zip"), destination = directory(work, "archive-out");
+        List<FileStore.Node> inputs = new ArrayList<>();
+        for (int i = 0; i < 24; i++) inputs.add(FileStore.local(file(work, "batch-" + i, "payload-" + i)));
+        ArchiveOps.pack(store, inputs, archive);
+        Bundle seed = new Bundle(); seed.putString("name", "read-batch.zip"); seed.putByteArray("bytes", Files.readAllBytes(archive.toPath())); call("seed", seed);
+        FileStore.Node container = store.list(documents).get(0);
+        List<FileStore.Node> members = new ArrayList<>();
+        for (int i = 0; i < 24; i++) members.add(FileStore.archiveNode(container, "batch-" + i, false, 0, 0));
+        call("clearCounters", null);
+        long start = android.os.SystemClock.elapsedRealtime();
+        List<FileStore.Node> outputs = store.copyAll(members, FileStore.local(destination), false);
+        long elapsed = android.os.SystemClock.elapsedRealtime() - start;
+        int reads = call("stats", null).getInt("readOpens");
+        String run = InstrumentationRegistry.getArguments().getString("benchmarkRun", "candidate");
+        org.json.JSONObject timing = new org.json.JSONObject().put("milliseconds", elapsed).put("containerReads", reads).put("members", outputs.size());
+        Files.write(new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getExternalFilesDir(null), "archive-copy-" + run + ".json").toPath(), timing.toString(2).getBytes(StandardCharsets.UTF_8));
+        for (int i = 0; i < outputs.size(); i++) assertEquals("payload-" + i, localText(outputs.get(i).file));
+        if (!run.equals("baseline")) assertEquals("The provider ZIP should be opened once for the whole copy", 1, reads);
+    }
+    @Test public void nestedProviderArchiveDirectoryReusesViewsAndCleansTemporaryFiles() throws Exception {
+        File tree = directory(work, "tree"), nested = directory(tree, "nested"); directory(nested, "empty");
+        for (int i = 0; i < 16; i++) file(tree, "item-" + i, "data-" + i);
+        file(nested, "zero", "");
+        File inner = new File(work, "inner.zip"), outer = new File(work, "outer.zip"), output = directory(work, "nested-out");
+        ArchiveOps.pack(store, List.of(FileStore.local(tree)), inner);
+        ArchiveOps.pack(store, List.of(FileStore.local(inner)), outer);
+        Bundle seed = new Bundle(); seed.putString("name", "outer.zip"); seed.putByteArray("bytes", Files.readAllBytes(outer.toPath())); call("seed", seed);
+        FileStore.Node provider = store.list(documents).get(0);
+        FileStore.Node embedded = FileStore.archiveNode(provider, "inner.zip", false, 0, 0);
+        FileStore.Node selected = FileStore.archiveNode(embedded, "tree/", true, 0, 0);
+        File cache = InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir();
+        Set<String> before = new HashSet<>(Arrays.asList(cache.list((dir, name) -> name.startsWith("import-"))));
+        call("clearCounters", null);
+        store.copy(selected, FileStore.local(output), false);
+        assertEquals(1, call("stats", null).getInt("readOpens"));
+        for (int i = 0; i < 16; i++) assertEquals("data-" + i, localText(new File(output, "tree/item-" + i)));
+        assertTrue(new File(output, "tree/nested/empty").isDirectory());
+        assertEquals(0, new File(output, "tree/nested/zero").length());
+        assertEquals(before, new HashSet<>(Arrays.asList(cache.list((dir, name) -> name.startsWith("import-")))));
+    }
     @Test public void recursiveCopyDoesNotEnumerateEachNewSafDirectory() throws Exception {
         File source = directory(work, "tree"), nested = directory(source, "nested");
         directory(nested, "empty");

@@ -27,10 +27,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * escape through renamed ancestors. Do not describe these checks as atomic compare-and-delete.
  */
 public final class RootFileOps {
-    static final int VERSION = 1, MAX_REQUEST = 8 * 1024 * 1024, MAX_EVENT = 256 * 1024;
-    static final int READY = 1, PREPARED = 2, STEP = 3, OK = 4, ERROR = 5, CANCELLED = 6;
-    static final int CREATE = 1, RENAME = 2, MOVE = 3, DELETE = 4, CHMOD = 5, DELETE_EMPTY = 6;
-    private static final int O_PATH = 010000000; // Linux UAPI, stable on all Android architectures.
+    static final int VERSION = 2, MAX_REQUEST = 8 * 1024 * 1024, MAX_EVENT = 256 * 1024, PAYLOAD_LIMIT = 128 * 1024;
+    static final int READY = 1, PREPARED = 2, STEP = 3, OK = 4, ERROR = 5, CANCELLED = 6, READ_PAYLOAD = 7;
+    static final int CREATE = 1, RENAME = 2, MOVE = 3, DELETE = 4, CHMOD = 5, DELETE_EMPTY = 6, WRITE_EMPTY = 7;
+    static final int O_PATH = 010000000; // Linux UAPI, stable on all Android architectures.
     private static final int MAX_ITEMS = 16384, MAX_DEPTH = 256;
     // A shorter self-deadline than the client's 30s wait prevents a surviving su ART child.
     private static final long STALL_MS = 29000;
@@ -56,15 +56,20 @@ public final class RootFileOps {
         final String name;
         final boolean directory;
         final List<Spec> items;
+        final long size;
         private Request(int operation, Spec source, Spec parent, String name, boolean directory, int mode, List<Spec> items) {
+            this(operation, source, parent, name, directory, mode, items, -1);
+        }
+        private Request(int operation, Spec source, Spec parent, String name, boolean directory, int mode, List<Spec> items, long size) {
             this.operation = operation; this.source = source; this.parent = parent; this.name = name;
-            this.directory = directory; this.mode = mode; this.items = items;
+            this.directory = directory; this.mode = mode; this.items = items; this.size = size;
         }
         static Request create(Spec parent, String name, boolean directory) { return new Request(CREATE, null, parent, name, directory, 0, List.of()); }
         static Request rename(Spec source, Spec parent, String name, boolean move) { return new Request(move ? MOVE : RENAME, source, parent, name, false, 0, List.of()); }
         static Request delete(Collection<Spec> items) { return new Request(DELETE, null, null, "", false, 0, new ArrayList<>(items)); }
         static Request deleteEmpty(Collection<Spec> items) { return new Request(DELETE_EMPTY, null, null, "", false, 0, new ArrayList<>(items)); }
         static Request chmod(Spec source, int mode) { return new Request(CHMOD, source, null, "", false, mode, List.of()); }
+        static Request writeEmpty(Spec target, long size) { return new Request(WRITE_EMPTY, target, null, "", false, 0, List.of(), size); }
         byte[] encode() throws IOException {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             try (DataOutputStream out = new DataOutputStream(bytes)) {
@@ -76,6 +81,7 @@ public final class RootFileOps {
                         if (items.size() > MAX_ITEMS) throw new IOException("删除批次超过 16384 项");
                         out.writeInt(items.size()); for (Spec spec : items) spec.write(out); break;
                     case CHMOD: source.write(out); out.writeInt(mode); break;
+                    case WRITE_EMPTY: source.write(out); out.writeLong(size); break;
                     default: throw new IOException("未知操作");
                 }
             }
@@ -90,6 +96,7 @@ public final class RootFileOps {
                     case CREATE: result = create(Spec.read(in), in.readUTF(), in.readBoolean()); break;
                     case RENAME: case MOVE: result = rename(Spec.read(in), Spec.read(in), in.readUTF(), operation == MOVE); break;
                     case CHMOD: result = chmod(Spec.read(in), in.readInt()); break;
+                    case WRITE_EMPTY: result = writeEmpty(Spec.read(in), in.readLong()); break;
                     case DELETE: case DELETE_EMPTY:
                         int count = in.readInt(); if (count < 0 || count > MAX_ITEMS) throw new IOException("无效批次数量");
                         List<Spec> items = new ArrayList<>(count);
@@ -141,7 +148,7 @@ public final class RootFileOps {
                         pid = in.readInt(); uid = in.readInt(); break;
                     case PREPARED: case STEP: case ERROR: text = in.readUTF(); break;
                     case OK: if (in.readBoolean()) result = Result.read(in); break;
-                    case CANCELLED: break;
+                    case CANCELLED: case READ_PAYLOAD: break;
                     default: throw new IOException("未知 ROOT 响应");
                 }
                 if (in.available() != 0) throw new IOException("ROOT 响应边界损坏");
@@ -200,7 +207,23 @@ public final class RootFileOps {
         }
     }
 
-    private static final class Channel {
+    private interface ProgressGate { void step(String name) throws IOException; }
+
+    /** Local shared-storage entry points never enter chmod or credential switching paths. */
+    static Result createShared(Request request) throws IOException {
+        if (request.operation != CREATE) throw new IOException("本地创建请求类型错误");
+        try (Scope scope = new Scope()) {
+            return new Prepared(request, scope).create(Tasks.Progress::step, true);
+        } catch (ErrnoException error) { throw new IOException(error); }
+    }
+    static Result moveShared(Request request) throws IOException {
+        if (request.operation != MOVE) throw new IOException("本地移动请求类型错误");
+        try (Scope scope = new Scope()) {
+            return new Prepared(request, scope).run(Tasks.Progress::step);
+        } catch (ErrnoException error) { throw new IOException(error); }
+    }
+
+    private static final class Channel implements ProgressGate {
         final DataInputStream input;
         final DataOutputStream output;
         final AtomicLong touched;
@@ -216,11 +239,21 @@ public final class RootFileOps {
             touched.set(SystemClock.elapsedRealtime());
             output.writeInt(bytes.size()); bytes.writeTo(output); output.flush();
         }
-        void step(String name) throws IOException {
+        public void step(String name) throws IOException {
             send(STEP, name, null);
             boolean proceed = input.readBoolean();
             touched.set(SystemClock.elapsedRealtime());
             if (!proceed) throw new Cancelled();
+        }
+        int readPayload(byte[] buffer) throws IOException {
+            send(READ_PAYLOAD, "", null);
+            int count = input.readInt();
+            touched.set(SystemClock.elapsedRealtime());
+            if (count == -2) throw new Cancelled();
+            if (count == -1) return -1;
+            if (count <= 0 || count > buffer.length) throw new EOFException("ROOT 数据块长度无效");
+            input.readFully(buffer, 0, count);
+            return count;
         }
     }
 
@@ -230,9 +263,10 @@ public final class RootFileOps {
         Handle parent, writable;
         Entry source;
         final List<Entry> items = new ArrayList<>();
-        final Set<String> critical = criticalIdentities();
+        final Set<String> critical;
         Prepared(Request request, Scope scope) throws IOException, ErrnoException {
             this.request = request; this.scope = scope;
+            critical = request.operation == CREATE || request.operation == WRITE_EMPTY ? Collections.emptySet() : criticalIdentities();
             switch (request.operation) {
                 case CREATE:
                     checkName(request.name); parent = pinDirectory(request.parent, scope);
@@ -280,12 +314,26 @@ public final class RootFileOps {
                     requireSame(path.stat, writable.stat);
                     if (!regularOrDirectory(writable.stat)) throw new IOException("chmod 目标类型已改变");
                     break;
+                case WRITE_EMPTY:
+                    if (request.size < -1 || request.source.identity == null || request.source.parentIdentity == null || request.source.follows)
+                        throw new IOException("新文件写入缺少固定身份或长度无效");
+                    source = entry(request.source, scope);
+                    requireEmpty(source.stat);
+                    Handle empty = scope.open(source.path(), O_PATH | OsConstants.O_NOFOLLOW | OsConstants.O_NONBLOCK);
+                    requireSame(source.stat, empty.stat); requireEmpty(empty.stat);
+                    // Reopen only our classified FD. A replaced leaf must never open a device/FIFO.
+                    writable = scope.open(empty.proc(), OsConstants.O_WRONLY | OsConstants.O_NONBLOCK);
+                    requireSame(source.stat, writable.stat); requireEmpty(writable.stat); source.requireCurrent();
+                    break;
                 default: throw new IOException("未知操作");
             }
         }
-        Result run(Channel channel) throws IOException, ErrnoException {
+        Result run(ProgressGate channel) throws IOException, ErrnoException {
             switch (request.operation) {
                 case CREATE: return create(channel);
+                case WRITE_EMPTY:
+                    if (!(channel instanceof Channel)) throw new IOException("新文件写入需要数据通道");
+                    return writeEmpty((Channel) channel);
                 case CHMOD:
                     channel.step(source.name); source.requireCurrent();
                     Os.fchmod(writable.fd(), request.mode);
@@ -307,16 +355,46 @@ public final class RootFileOps {
                 default: throw new IOException("未知操作");
             }
         }
-        private Result create(Channel channel) throws IOException, ErrnoException {
+        private Result writeEmpty(Channel channel) throws IOException, ErrnoException {
+            channel.step(source.name); source.requireCurrent(); requireEmpty(Os.fstat(writable.fd()));
+            byte[] buffer = new byte[PAYLOAD_LIMIT];
+            long total = 0; int count;
+            while ((count = channel.readPayload(buffer)) != -1) {
+                if (request.size >= 0 && count > request.size - total) throw new IOException("来源超过声明长度");
+                int offset = 0;
+                while (offset < count) {
+                    int written = Os.write(writable.fd(), buffer, offset, count - offset);
+                    if (written <= 0) throw new IOException("目标写入未前进");
+                    offset += written;
+                }
+                total += count;
+            }
+            if (request.size >= 0 && total != request.size) throw new IOException("来源长度不完整");
+            channel.step("sync:" + source.name); source.requireCurrent();
+            Os.fsync(writable.fd());
+            StructStat actual = Os.fstat(writable.fd()); requireSame(source.stat, actual);
+            if (actual.st_size != total || actual.st_nlink != 1 || !OsConstants.S_ISREG(actual.st_mode)
+                    || actual.st_mode != source.stat.st_mode || actual.st_uid != source.stat.st_uid || actual.st_gid != source.stat.st_gid)
+                throw new IOException("写入期间新文件的长度、类型或元数据变化");
+            source.requireCurrent();
+            return new Result(request.source.path, actual, id(source.parent.stat));
+        }
+        private static void requireEmpty(StructStat stat) throws IOException {
+            if (!OsConstants.S_ISREG(stat.st_mode) || stat.st_size != 0 || stat.st_nlink != 1)
+                throw new IOException("流式复制仅支持本次创建的空普通文件");
+        }
+        private Result create(ProgressGate channel) throws IOException, ErrnoException { return create(channel, false); }
+        private Result create(ProgressGate channel, boolean appIdentity) throws IOException, ErrnoException {
             channel.step(request.name);
             String destination = parent.child(request.name);
             if (request.directory) {
-                createDirectoryAsOwner(parent, request.name);
+                if (appIdentity) Os.mkdir(destination, 0755);
+                else createDirectoryAsOwner(parent, request.name);
                 // No path-based chown, not even on a supposedly fresh mkdir result.
                 try (Scope opened = new Scope()) {
                     Handle directory = opened.open(destination, O_PATH | OsConstants.O_NOFOLLOW | OsConstants.O_NONBLOCK);
                     StructStat actual = directory.stat;
-                    if (!OsConstants.S_ISDIR(actual.st_mode) || actual.st_uid != parent.stat.st_uid || actual.st_gid != parent.stat.st_gid)
+                    if (!OsConstants.S_ISDIR(actual.st_mode) || !appIdentity && (actual.st_uid != parent.stat.st_uid || actual.st_gid != parent.stat.st_gid))
                         throw new IOException("新目录的 owner/type 不符合父目录映射；未对路径执行 chown/chmod");
                     // mkdir's mode is a request, not an explicit chmod contract. FUSE/default ACLs
                     // may map 0755 to e.g. 2770; return the actual mode rather than reject or fake it.
@@ -337,10 +415,10 @@ public final class RootFileOps {
                     if (!OsConstants.S_ISREG(file.stat.st_mode)) throw new IOException("新文件不是普通文件");
                     channel.step("created:" + request.name);
                     StructStat born = Os.fstat(file.fd()); requireSame(file.stat, born);
-                    if (born.st_uid != parent.stat.st_uid || born.st_gid != parent.stat.st_gid)
+                    if (!appIdentity && (born.st_uid != parent.stat.st_uid || born.st_gid != parent.stat.st_gid))
                         Os.fchown(file.fd(), parent.stat.st_uid, parent.stat.st_gid);
                     StructStat actual = Os.fstat(file.fd()); requireSame(file.stat, actual);
-                    if (!OsConstants.S_ISREG(actual.st_mode) || actual.st_uid != parent.stat.st_uid || actual.st_gid != parent.stat.st_gid)
+                    if (!OsConstants.S_ISREG(actual.st_mode) || !appIdentity && (actual.st_uid != parent.stat.st_uid || actual.st_gid != parent.stat.st_gid))
                         throw new IOException("文件系统没有应用新文件的父目录 owner 映射");
                     requireEntry(destination, actual);
                     result = new Result(join(request.parent.path, request.name), actual, id(parent.stat));
@@ -357,7 +435,7 @@ public final class RootFileOps {
                 }
             }
         }
-        private Result rename(Channel channel) throws IOException, ErrnoException {
+        private Result rename(ProgressGate channel) throws IOException, ErrnoException {
             // This fast path NEVER copies, not even when rename/link later returns EXDEV.
             if (source.stat.st_dev != parent.stat.st_dev) {
                 if (request.operation == MOVE) return null;
@@ -513,7 +591,7 @@ public final class RootFileOps {
         requireEntry(path, entry);
         return compared;
     }
-    private static void remove(Entry entry, Channel channel, int depth, Set<String> critical) throws IOException, ErrnoException {
+    private static void remove(Entry entry, ProgressGate channel, int depth, Set<String> critical) throws IOException, ErrnoException {
         if (depth > MAX_DEPTH) throw new IOException("递归目录超过 256 层，已安全停止");
         rejectCritical(entry, critical); entry.requireCurrent();
         channel.step(entry.name); entry.requireCurrent();

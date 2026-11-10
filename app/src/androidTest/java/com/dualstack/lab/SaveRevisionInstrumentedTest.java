@@ -250,6 +250,7 @@ public class SaveRevisionInstrumentedTest {
         } finally { fixture("releaseRead", null); }
         awaitLoaded(A); awaitSaveFinished();
         assertEquals(B, sourceText()); assertDirtyBody(A, fingerprint()); assertDraft(draftId(), A, fingerprint());
+        scenario.onActivity(activity -> assertTrue("Recreated caller must inherit the completed save", session(activity).sourceSaved));
     }
 
     @Test public void queuedPageAndSaveThenPageRecheckNewerBodyInsteadOfDroppingIt() throws Exception {

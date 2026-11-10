@@ -7,6 +7,8 @@ import java.util.*;
 import java.util.zip.*;
 
 final class ArchiveOps {
+    interface RewriteBoundary { void beforeRewrite(File archive) throws IOException; }
+    static volatile RewriteBoundary testRewriteBoundary;
     record Item(String path, String name, boolean directory, long size, long modified) {}
     private record Stamp(long size, long modified, long device, long inode) {}
     private record Index(Stamp stamp, Map<String, List<Item>> folders) {}
@@ -263,12 +265,14 @@ final class ArchiveOps {
     static InputStream openEntry(File file, String entry) throws IOException {
         if (isRar(file)) return RarArchiveOps.openEntry(file, entry);
         if (ArchiveFormats.supported(file)) return ArchiveFormats.openEntry(file, entry);
-        if (isEncryptedZip(file)) {
-            char[] password = password(file);
-            if (password == null) throw new PasswordRequired(file);
-            return openZip4j(file, entry, password);
+        ZipFile zip;
+        try { zip = new ZipFile(file); }
+        catch (ZipException error) {
+            if (!encrypted(error.getMessage())) throw error;
+            char[] secret = password(file);
+            if (secret == null) throw new PasswordRequired(file);
+            return openZip4j(file, entry, secret);
         }
-        ZipFile zip = new ZipFile(file);
         try {
             ZipEntry item = zip.getEntry(entry);
             if (item == null || item.isDirectory()) throw new IOException("归档条目不存在");
@@ -285,6 +289,65 @@ final class ArchiveOps {
                 return openZip4j(file, entry, password);
             }
             throw error;
+        }
+    }
+    /** One copy operation owns this reader; entry streams close independently of its archive. */
+    static final class ReadSession implements AutoCloseable {
+        private final File file;
+        private ZipFile zip;
+        private net.lingala.zip4j.ZipFile encryptedZip;
+        private final Map<String, Long> sizes = new HashMap<>();
+        private final Set<String> sizeFolders = new HashSet<>();
+
+        ReadSession(File file) throws IOException {
+            this.file = file;
+            if (isRar(file) || ArchiveFormats.supported(file)) return;
+            try { zip = new ZipFile(file); }
+            catch (ZipException error) {
+                if (!encrypted(error.getMessage())) throw error;
+                openEncrypted();
+            }
+        }
+        private void openEncrypted() throws IOException {
+            char[] secret = password(file);
+            if (secret == null) throw new PasswordRequired(file);
+            encryptedZip = new net.lingala.zip4j.ZipFile(file, secret);
+        }
+        InputStream open(String entry) throws IOException {
+            Tasks.Progress.check(); validateEntry(entry);
+            if (zip != null) {
+                ZipEntry item = zip.getEntry(entry);
+                if (item == null || item.isDirectory()) throw new IOException("归档条目不存在");
+                return zip.getInputStream(item);
+            }
+            if (encryptedZip != null) {
+                FileHeader header = encryptedZip.getFileHeader(entry);
+                if (header == null || header.isDirectory()) throw new IOException("归档条目不存在");
+                return encryptedZip.getInputStream(header);
+            }
+            return openEntry(file, entry);
+        }
+        long size(String entry) throws IOException {
+            if (zip != null) {
+                ZipEntry item = zip.getEntry(entry);
+                if (item == null || item.isDirectory()) throw new IOException("归档条目不存在");
+                return item.getSize();
+            }
+            if (encryptedZip != null) {
+                FileHeader item = encryptedZip.getFileHeader(entry);
+                if (item == null || item.isDirectory()) throw new IOException("归档条目不存在");
+                return item.getUncompressedSize();
+            }
+            String prefix = entry.substring(0, entry.lastIndexOf('/') + 1);
+            if (sizeFolders.add(prefix))
+                for (Item item : list(file, prefix)) sizes.put(item.path(), item.size());
+            Long size = sizes.get(entry);
+            if (size == null) throw new IOException("归档条目不存在");
+            return size;
+        }
+        @Override public void close() throws IOException {
+            if (zip != null) zip.close();
+            if (encryptedZip != null) encryptedZip.close();
         }
     }
     private static InputStream openZip4j(File file, String entry, char[] password) throws IOException {
@@ -433,56 +496,62 @@ final class ArchiveOps {
         rewrite(archive, remove, rename, additions, Collections.emptySet());
     }
     static synchronized void removeAll(File archive, Set<String> removals) throws IOException {
+        rewriteBatch(archive, Collections.emptyMap(), removals);
+    }
+    static synchronized void rewriteBatch(File archive, Map<String, File> additions, Set<String> removals) throws IOException {
         for (String name : removals) { validateEntry(name); if (name.isEmpty()) throw new IOException("不能删除归档根目录"); }
-        rewrite(archive, null, null, Collections.emptyMap(), removals);
+        rewrite(archive, null, null, additions, removals);
     }
     private static void rewrite(File archive, String remove, String rename, Map<String, File> additions,
                                 Set<String> removals) throws IOException {
-        Tasks.Progress.check();
-        FileStore.FileState before = FileStore.FileState.read(archive);
-        if (isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive))
-            throw new IOException("此归档格式暂不支持直接修改，请先解压后编辑");
-        for (String name : additions.keySet()) validateEntry(name);
-        if (rename != null) validateEntry(rename);
-        File tmp = File.createTempFile(".archive-", ".zip", archive.getParentFile());
-        boolean apk = ApkInstall.isApkName(archive.getName());
-        try {
-            Set<String> written = new HashSet<>();
-            try (ZipFile zip = new ZipFile(archive); ZipOutputStream out = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(tmp)))) {
-                Enumeration<? extends ZipEntry> entries = zip.entries();
-                while (entries.hasMoreElements()) {
-                    ZipEntry e = entries.nextElement(); String name = e.getName();
-                    Tasks.Progress.check();
-                    if (removals.contains(name) || removedParent(name, removals)) continue;
-                    boolean removed = remove != null && (name.equals(remove) || (remove.endsWith("/") && name.startsWith(remove)));
-                    if (apk && isSignature(name)) continue;
-                    if (additions.containsKey(name)) continue;
-                    if (removed && rename == null) continue;
-                    String to = removed ? rename + name.substring(remove.length()) : name;
-                    if (!written.add(to)) throw new IOException("归档存在重复条目：" + to);
-                    ZipEntry next = new ZipEntry(to);
-                    if (e.getTime() >= 0) next.setTime(e.getTime());
-                    if (e.getComment() != null) next.setComment(e.getComment());
-                    if (e.getMethod() == ZipEntry.STORED) {
-                        next.setMethod(ZipEntry.STORED); next.setSize(e.getSize()); next.setCrc(e.getCrc());
-                    }
-                    out.putNextEntry(next);
-                    if (!e.isDirectory()) try (InputStream in = zip.getInputStream(e)) { FileStore.pump(in, out); }
-                    out.closeEntry();
-                }
-                for (Map.Entry<String, File> added : additions.entrySet()) {
-                    Tasks.Progress.check();
-                    if (!written.add(added.getKey())) throw new IOException("条目冲突");
-                    out.putNextEntry(new ZipEntry(added.getKey()));
-                    if (added.getValue() != null)
-                        try (InputStream in = new FileInputStream(added.getValue())) { FileStore.pump(in, out); }
-                    out.closeEntry();
-                }
-            }
+        try (Tasks.Progress.Phase stage = Tasks.Progress.stage("重建归档")) {
+            RewriteBoundary boundary = testRewriteBoundary; if (boundary != null) boundary.beforeRewrite(archive);
             Tasks.Progress.check();
-            FileStore.publish(tmp, archive, before);
-            forget(archive);
-        } finally { Files.deleteIfExists(tmp.toPath()); }
+            FileStore.FileState before = FileStore.FileState.read(archive);
+            if (isRar(archive) || ArchiveFormats.supported(archive) || isEncryptedZip(archive))
+                throw new IOException("此归档格式暂不支持直接修改，请先解压后编辑");
+            for (String name : additions.keySet()) validateEntry(name);
+            if (rename != null) validateEntry(rename);
+            File tmp = File.createTempFile(".archive-", ".zip", archive.getParentFile());
+            boolean apk = ApkInstall.isApkName(archive.getName());
+            try {
+                Set<String> written = new HashSet<>();
+                try (ZipFile zip = new ZipFile(archive); ZipOutputStream out = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(tmp)))) {
+                    Enumeration<? extends ZipEntry> entries = zip.entries();
+                    while (entries.hasMoreElements()) {
+                        ZipEntry e = entries.nextElement(); String name = e.getName();
+                        Tasks.Progress.check();
+                        if (removals.contains(name) || removedParent(name, removals)) continue;
+                        boolean removed = remove != null && (name.equals(remove) || (remove.endsWith("/") && name.startsWith(remove)));
+                        if (apk && isSignature(name)) continue;
+                        if (additions.containsKey(name)) continue;
+                        if (removed && rename == null) continue;
+                        String to = removed ? rename + name.substring(remove.length()) : name;
+                        if (!written.add(to)) throw new IOException("归档存在重复条目：" + to);
+                        ZipEntry next = new ZipEntry(to);
+                        if (e.getTime() >= 0) next.setTime(e.getTime());
+                        if (e.getComment() != null) next.setComment(e.getComment());
+                        if (e.getMethod() == ZipEntry.STORED) {
+                            next.setMethod(ZipEntry.STORED); next.setSize(e.getSize()); next.setCrc(e.getCrc());
+                        }
+                        out.putNextEntry(next);
+                        if (!e.isDirectory()) try (InputStream in = zip.getInputStream(e)) { FileStore.pump(in, out); }
+                        out.closeEntry();
+                    }
+                    for (Map.Entry<String, File> added : additions.entrySet()) {
+                        Tasks.Progress.check();
+                        if (!written.add(added.getKey())) throw new IOException("条目冲突");
+                        out.putNextEntry(new ZipEntry(added.getKey()));
+                        if (added.getValue() != null)
+                            try (InputStream in = new FileInputStream(added.getValue())) { FileStore.pump(in, out); }
+                        out.closeEntry();
+                    }
+                }
+                Tasks.Progress.check();
+                FileStore.publish(tmp, archive, before);
+                forget(archive);
+            } finally { Files.deleteIfExists(tmp.toPath()); }
+        }
     }
     private static boolean removedParent(String name, Set<String> removals) {
         for (int slash = name.indexOf('/'); slash >= 0; slash = name.indexOf('/', slash + 1))
@@ -513,20 +582,22 @@ final class ArchiveOps {
         pack(store, nodes, output, "zip", new char[0]);
     }
     static void pack(FileStore store, List<FileStore.Node> nodes, File output, String format, char[] password) throws IOException {
-        if (!format.equals("zip")) {
-            if (password.length != 0) throw new IOException("此格式不支持压缩密码，请使用 ZIP");
-            ArchiveFormats.pack(store, nodes, output, format); return;
-        }
-        if (password.length == 0) {
-            try (ZipOutputStream out = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(output)))) {
-                Set<String> seen = new HashSet<>();
-                for (FileStore.Node n : nodes) packNode(store, n, n.name, out, seen);
+        try (Tasks.Progress.Phase stage = Tasks.Progress.stage("压缩文件")) {
+            if (!format.equals("zip")) {
+                if (password.length != 0) throw new IOException("此格式不支持压缩密码，请使用 ZIP");
+                ArchiveFormats.pack(store, nodes, output, format); return;
             }
-        } else try (net.lingala.zip4j.io.outputstream.ZipOutputStream out = new net.lingala.zip4j.io.outputstream.ZipOutputStream(
-                new BufferedOutputStream(new FileOutputStream(output)), password)) {
-            Set<String> seen = new HashSet<>();
-            for (FileStore.Node node : nodes) packEncrypted(store, node, node.name, out, seen);
-            cachePassword(output, password);
+            if (password.length == 0) {
+                try (ZipOutputStream out = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(output)))) {
+                    Set<String> seen = new HashSet<>();
+                    for (FileStore.Node n : nodes) packNode(store, n, n.name, out, seen);
+                }
+            } else try (net.lingala.zip4j.io.outputstream.ZipOutputStream out = new net.lingala.zip4j.io.outputstream.ZipOutputStream(
+                    new BufferedOutputStream(new FileOutputStream(output)), password)) {
+                Set<String> seen = new HashSet<>();
+                for (FileStore.Node node : nodes) packEncrypted(store, node, node.name, out, seen);
+                cachePassword(output, password);
+            }
         }
     }
     private static void packEncrypted(FileStore store, FileStore.Node node, String path,

@@ -746,8 +746,14 @@ final class SafRecovery {
                 .setNegativeButton("取消", null).show();
     }
     private static void viewBackups(Activity activity) {
-        Intent intent = new Intent(activity, RecycleBinActivity.class);
-        try { activity.startActivity(intent); } catch (RuntimeException error) { Tasks.showError(activity, error); }
+        Tasks.run(activity, () -> pending(activity), records -> {
+            if (records.isEmpty()) { Tasks.toast(activity, "暂无待恢复的 SAF 保存备份"); return; }
+            String[] names = new String[records.size()];
+            for (int i = 0; i < records.size(); i++) names[i] = records.get(i).name;
+            new AlertDialog.Builder(activity).setTitle("SAF 保存恢复")
+                    .setItems(names, (dialog, which) -> confirmRestore(activity, records.get(which), null))
+                    .setNegativeButton("关闭", null).show();
+        });
     }
 
     /** Hook from MainActivity.onCreate; scanning and all restores run off the UI thread. */

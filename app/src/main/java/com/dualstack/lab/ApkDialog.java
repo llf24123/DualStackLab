@@ -18,19 +18,24 @@ final class ApkDialog {
     static void show(Activity activity, FileStore.Node node, Runnable browse, Runnable tools,
                      Runnable install, Runnable silent, Tasks.Done<File> jump) {
         LinearLayout body = Ui.column(activity);
-        body.setPadding(Ui.dp(activity, 18), Ui.dp(activity, 16), Ui.dp(activity, 18), Ui.dp(activity, 10));
+        body.setPadding(Ui.dp(activity, 16), Ui.dp(activity, 12), Ui.dp(activity, 16), Ui.dp(activity, 8));
         LinearLayout heading = Ui.row(activity);
         ImageView icon = Ui.image(activity, R.drawable.ic_package, Ui.ACCENT);
-        heading.addView(icon, new LinearLayout.LayoutParams(Ui.dp(activity, 52), Ui.dp(activity, 52)));
+        heading.addView(icon, new LinearLayout.LayoutParams(Ui.dp(activity, 44), Ui.dp(activity, 44)));
         LinearLayout titles = Ui.column(activity);
-        TextView name = Ui.text(activity, node.name, 23, Ui.TEXT);
-        TextView version = Ui.text(activity, "读取中…", 14, Ui.MUTED);
-        name.setMinHeight(Ui.dp(activity, 48)); version.setMinHeight(Ui.dp(activity, 48));
+        TextView name = Ui.text(activity, node.name, 20, Ui.TEXT);
+        TextView version = Ui.text(activity, "读取中…", 12, Ui.MUTED);
+        name.setMaxLines(2); name.setEllipsize(TextUtils.TruncateAt.END);
+        version.setMinHeight(Ui.dp(activity, 20));
         titles.addView(name); titles.addView(version);
         name.setOnLongClickListener(v -> { copy(activity, name.getText().toString()); return true; });
         version.setOnLongClickListener(v -> { copy(activity, version.getText().toString()); return true; });
         LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(0, -2, 1); titleParams.leftMargin = Ui.dp(activity, 12);
         heading.addView(titles, titleParams); body.addView(heading);
+        View divider = Ui.line(activity);
+        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(-1, Ui.dp(activity, 1));
+        dividerParams.topMargin = Ui.dp(activity, 10); dividerParams.bottomMargin = Ui.dp(activity, 6);
+        body.addView(divider, dividerParams);
         Map<String, TextView> fields = new LinkedHashMap<>();
         ScrollView scroll = new ScrollView(activity); scroll.addView(body);
         AlertDialog dialog = new AlertDialog.Builder(activity).setView(scroll)
@@ -116,14 +121,19 @@ final class ApkDialog {
     }
     private static void field(Activity activity, LinearLayout parent, Map<String, TextView> fields, String key, String value, Runnable click) {
         LinearLayout row = Ui.row(activity);
-        TextView label = Ui.single(activity, key, 14, Ui.TEXT);
-        row.addView(label, new LinearLayout.LayoutParams(Ui.dp(activity, 102), Ui.dp(activity, 48)));
+        int height = Ui.dp(activity, click == null ? 30 : 48);
+        TextView label = Ui.single(activity, key, 13, Ui.TEXT);
+        row.addView(label, new LinearLayout.LayoutParams(Ui.dp(activity, 82), height));
         TextView text = Ui.single(activity, value, 13, Ui.MUTED); text.setEllipsize(TextUtils.TruncateAt.END);
         text.setContentDescription(key + " " + value); text.setTooltipText(value);
-        row.addView(text, new LinearLayout.LayoutParams(0, Ui.dp(activity, 48), 1));
+        row.addView(text, new LinearLayout.LayoutParams(0, height, 1));
         text.setOnLongClickListener(v -> { copy(activity, text.getText().toString()); return true; });
         label.setOnLongClickListener(v -> { copy(activity, text.getText().toString()); return true; });
-        if (click != null) row.setOnClickListener(v -> click.run());
+        if (click != null) {
+            row.setOnClickListener(v -> click.run());
+            text.setOnClickListener(v -> click.run());
+            label.setOnClickListener(v -> click.run());
+        }
         fields.put(key, text); parent.addView(row);
     }
     private static void copy(Activity a, String value) {

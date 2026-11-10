@@ -16,6 +16,17 @@ final class RootDirectoryReader {
     private static ScheduledFuture<?> idle;
 
     record Listing(String identity, String output) {}
+    static String nearestDirectory(String path) throws IOException {
+        return query("path=" + FileStore.quote(path) + "\n"
+                + "while :; do\n"
+                + "if [ -d \"$path\" ]; then printf '%s' \"$path\"; break; fi\n"
+                + "if [ \"$path\" = / ]; then echo '无法读取根目录' >&2; exit 1; fi\n"
+                + "parent=${path%/*}; [ -n \"$parent\" ] || parent=/\n"
+                + "if [ -e \"$parent\" ] && [ -d \"$parent\" ] && [ ! -x \"$parent\" ]; then "
+                + "echo '没有目录访问权限' >&2; exit 1; fi\n"
+                + "path=$parent\ndone").trim();
+    }
+
     static Listing snapshot(String path) throws IOException {
         String marker = "__DUALSTACK_PARENT_" + UUID.randomUUID() + "_";
         String quoted = FileStore.quote(path), listing = FileStore.rootListCommand(path);
@@ -35,6 +46,15 @@ final class RootDirectoryReader {
     static String stat(String path, String format, boolean followLinks) throws IOException {
         return query("/system/bin/toybox stat " + (followLinks ? "-L " : "") + "-c "
                 + FileStore.quote(format) + " -- " + FileStore.quote(path)).trim();
+    }
+    static String[] identities(String... paths) throws IOException {
+        StringBuilder command = new StringBuilder("/system/bin/toybox stat -L -c '%d:%i' --");
+        for (String path : paths) command.append(' ').append(FileStore.quote(path));
+        String[] identities = query(command.toString()).trim().split("\\n");
+        if (identities.length != paths.length) throw new IOException("ROOT 身份快照数量不匹配");
+        for (String identity : identities)
+            if (!identity.matches("[0-9]+:[0-9]+")) throw new IOException("ROOT 身份快照无效");
+        return identities;
     }
     static String inspect(String path) throws IOException {
         String quoted = FileStore.quote(path);

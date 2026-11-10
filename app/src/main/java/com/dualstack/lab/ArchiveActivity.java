@@ -17,7 +17,7 @@ import java.util.*;
 import java.util.zip.*;
 
 public class ArchiveActivity extends LabActivity {
-    private static final int IMPORT = 301, OUTPUT = 302;
+    private static final int IMPORT = 301, OUTPUT = 302, EDIT = 303;
     private FileStore store;
     private FileStore.Node source;
     private File archive, pendingOutput;
@@ -219,7 +219,12 @@ public class ArchiveActivity extends LabActivity {
             path.setText("/" + prefix); summary.setText(items.size() + " 项 · " + FileStore.size(archive.length()));
         }, error -> { if (token == reloadGeneration) { refresh.setRefreshing(false); Tasks.showError(this, error); } });
     }
-    @Override protected void onResume() { super.onResume(); if (archive != null) reload(true); }
+    private void refreshChangedSource() {
+        if (archive == null || busy) return;
+        Tasks.run(this, () -> {
+            synchronized (workspaceLock) { return !Objects.equals(sourceRevision, store.fingerprint(source)); }
+        }, changed -> { if (changed) reload(true); });
+    }
     private void up() {
         if (prefix.isEmpty()) return;
         String p = prefix.substring(0, prefix.length() - 1);
@@ -256,7 +261,7 @@ public class ArchiveActivity extends LabActivity {
                     boolean binary = ResXmlDocument.isResXmlBlock(ArchiveOps.bytes(archive, item.path(), EditorActivity.LIMIT));
                     return editorIntent(item.path(), binary ? "xml" : null);
                 }
-            }, this::startActivity); return;
+            }, this::openEditor); return;
         }
         edit(item.path(), null);
     }
@@ -270,8 +275,9 @@ public class ArchiveActivity extends LabActivity {
     private void edit(String entry, String mode) {
         Tasks.run(this, () -> {
             synchronized (workspaceLock) { return editorIntent(entry, mode); }
-        }, this::startActivity);
+        }, this::openEditor);
     }
+    private void openEditor(Intent intent) { startActivityForResult(intent, EDIT); }
     private void itemMenu(ArchiveOps.Item item) {
         String[] options = rar ? new String[]{"打开", "解压此项"}
                 : new String[]{"打开", "解压此项", "替换资源", "重命名", "删除"};
@@ -285,15 +291,10 @@ public class ArchiveActivity extends LabActivity {
                         }
                         case 3 -> rename(item);
                         case 4 -> new AlertDialog.Builder(this).setTitle("删除 " + item.name() + "？")
-                                .setMessage("删除前会生成可恢复备份，任务进度可在任务中心查看。")
-                                .setNegativeButton("取消", null).setPositiveButton("删除", (x, w) -> {
-                                    if (rar || busy) return;
-                                    FileStore.Node node = FileStore.archiveNode(source, item.path(), item.directory(), item.size(), item.modified());
-                                    Operations.Spec spec = Operations.Spec.of(Operations.DELETE, List.of(node), store.parent(node), null);
-                                    spec.sourceRevision = sourceRevision;
-                                    try { Operations.get(this).enqueue(spec); startActivity(new Intent(this, TaskCenterActivity.class)); }
-                                    catch (Exception error) { Tasks.showError(this, error); }
-                                }).show();
+                                .setMessage("将永久删除归档中的此项。")
+                                .setNegativeButton("取消", null).setPositiveButton("删除", (x, w) -> change(() -> {
+                                    ArchiveOps.rewrite(archive, item.path(), null, Collections.emptyMap()); return true;
+                                })).show();
                     }
                 }).show();
     }
@@ -336,6 +337,7 @@ public class ArchiveActivity extends LabActivity {
     }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == EDIT) { if (result == RESULT_OK) reload(true); return; }
         if (result != RESULT_OK || data == null || data.getData() == null) return;
         if (request == IMPORT) {
             String target = replacement, current = prefix;
@@ -548,7 +550,7 @@ public class ArchiveActivity extends LabActivity {
                     .setView(body).setNegativeButton("关闭", null).setPositiveButton("反汇编到工作区", (d, w) -> disassemble(entry)).create();
             classes.setOnItemClickListener((p, v, pos, id) -> {
                 String descriptor = adapter.getItem(pos);
-                Tasks.run(this, () -> classPreview(entry, descriptor), preview -> startActivity(
+                Tasks.run(this, () -> classPreview(entry, descriptor), preview -> openEditor(
                         classEditorIntent(entry, descriptor, preview)));
             }); dialog.show();
         });

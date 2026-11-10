@@ -10,8 +10,8 @@ classifier `release`. The upstream build uses Android NDK 29.0.14206865.
 Their 64-bit native ELF LOAD segments support 16 KB page alignment.
 See the delivery evidence for checks of the final APK.
 
-`terminal-view` remains an unmodified AAR. `terminal-emulator` Java sources
-are built locally from `terminal-emulator/`; its native libraries are copied
+`terminal-view` and `terminal-emulator` Java sources are built locally from
+the corresponding modules. The emulator's native libraries are copied
 unchanged from the pinned AAR. No local NDK is required.
 
 DualStackLab modifications (October 13, 2026), limited to TerminalSession.java:
@@ -21,7 +21,7 @@ DualStackLab modifications (October 13, 2026), limited to TerminalSession.java:
 - Continue draining all readable bytes after parent exit without a fixed
   wall-clock cutoff. An idle poll after parent exit ends reading when a
   detached descendant retains the PTY. Continuously producing descendants
-  can keep the session open until explicit stop or the app session timeout.
+  can keep the session open until explicit stop or natural process exit.
 - Dispatch copied input bytes in order on a background executor with a
   1 MiB pending-byte limit. Blocking PTY stdin no longer blocks the UI thread.
 The original source remains in the complete upstream archive below.
@@ -42,3 +42,5 @@ Source archive:
 https://codeload.github.com/termux/termux-app/zip/8629e632fcb95da272221be327db653fb24befe9
 
 No code or resources from MT Manager are bundled.
+
+The terminal-view module uses sources from the same 8629e632fc revision. Local changes keep text selection separate from body touch gestures and localize its actions.

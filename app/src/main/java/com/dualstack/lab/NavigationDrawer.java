@@ -8,7 +8,7 @@ import android.widget.*;
 import java.io.File;
 
 final class NavigationDrawer {
-    static Dialog show(Activity activity, Runnable root, Runnable internal, Runnable installed, Runnable recycleBin) {
+    static Dialog show(Activity activity, Runnable root, Runnable internal, Runnable installed) {
         Dialog dialog = new Dialog(activity); dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout body = Ui.column(activity); body.setBackgroundColor(Ui.SURFACE);
         LinearLayout header = Ui.row(activity); header.setBackgroundColor(Ui.INK);
@@ -28,10 +28,8 @@ final class NavigationDrawer {
         storage(activity, content, "根目录", new File("/"), dialog, root);
         storage(activity, content, "内部存储", Environment.getExternalStorageDirectory(), dialog, internal);
         content.addView(section(activity, "工具"));
-        content.addView(row(activity, "任务中心", R.drawable.ic_copy, () -> { dialog.dismiss(); activity.startActivity(new android.content.Intent(activity, TaskCenterActivity.class)); }));
         content.addView(row(activity, "设备信息", R.drawable.ic_info, () -> { dialog.dismiss(); activity.startActivity(new android.content.Intent(activity, DeviceInfoActivity.class)); }));
         content.addView(row(activity, "已安装应用", R.drawable.ic_package, () -> { dialog.dismiss(); installed.run(); }));
-        content.addView(row(activity, "回收站", R.drawable.ic_trash, () -> { dialog.dismiss(); recycleBin.run(); }));
         body.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         dialog.setContentView(body); Window window = dialog.getWindow();
         if (window == null) return dialog;

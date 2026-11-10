@@ -35,7 +35,15 @@ public class TerminalInstrumentedTest {
         device.executeShellCommand("settings put secure show_ime_with_hard_keyboard 1");
     }
     @After public void cleanup() throws Exception {
-        if (scenario != null) scenario.close();
+        if (scenario != null && scenario.getState() != androidx.lifecycle.Lifecycle.State.DESTROYED) {
+            scenario.onActivity(activity -> {
+                try {
+                    java.lang.reflect.Method stop = TerminalActivity.class.getDeclaredMethod("stopSession");
+                    stop.setAccessible(true); stop.invoke(activity);
+                } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
+            });
+            scenario.close();
+        }
         device.unfreezeRotation(); device.setOrientationNatural();
         device.executeShellCommand("cmd uimode night no");
         device.executeShellCommand(previousKeyboard.equals("null")
@@ -86,6 +94,9 @@ public class TerminalInstrumentedTest {
     private void menu(String label) {
         click("终端菜单");
         UiObject2 item = device.wait(Until.findObject(By.text(label)), 10000);
+        if (item == null) {
+            try { capture("missing-menu"); } catch (Exception error) { throw new AssertionError(error); }
+        }
         assertNotNull(label, item); item.click();
     }
     private void capture(String name) throws Exception {
@@ -160,7 +171,7 @@ public class TerminalInstrumentedTest {
         input("trap 'printf CTRL_C_OK; exit 23' INT; printf INTERRUPT_READY; while :; do sleep 1; done\n");
         output("INTERRUPT_READY"); SystemClock.sleep(200);
         // Ctrl-C through the PTY ends the foreground process; the status it reports depends on the shell build.
-        click("终端 Ctrl"); input("c"); output("exit -2"); capture("elf-keys");
+        click("终端 Ctrl"); input("c"); output("CTRL_C_OK"); output("exit 23"); capture("elf-keys");
     }
 
     @Test public void pipeExecutionKeepsArgumentsAndOriginalDirectory() throws Exception {
@@ -175,7 +186,7 @@ public class TerminalInstrumentedTest {
     }
 
     @Test public void rootPtyInputAndStopKillsDescendantsAndCleansStagedFiles() throws Exception {
-        Assume.assumeTrue(FileStore.shell("id -u", true).trim().equals("0"));
+        Assume.assumeTrue("Requires a granted su binary", RootAccess.available());
         File childPid = new File(work, "child.pid");
         File source = script("root.sh", "id -u; [ -t 0 ] && [ -t 1 ] && printf 'ROOT_PTY\\n'\n"
                 + "read value; printf 'ROOT_INPUT=%s\\n' \"$value\"\nsleep 120 &\necho $! > child.pid\nprintf CHILD_RUNNING\nwait\n");
@@ -211,7 +222,7 @@ public class TerminalInstrumentedTest {
     }
 
     @Test public void restrictedDataAdbScriptAndRootElfExecuteInPty() throws Exception {
-        Assume.assumeTrue(FileStore.shell("id -u", true).trim().equals("0"));
+        Assume.assumeTrue("Requires a granted su binary", RootAccess.available());
         String directory = "/data/adb/dualstack-terminal-review-" + UUID.randomUUID();
         File original = script("private.sh", "[ -t 0 ] && printf DATA_ADB_PTY; pwd; id -u; exit 12\n");
         File elf = new File(work, "root.elf"); Files.copy(new File("/system/bin/sh").toPath(), elf.toPath());
@@ -230,21 +241,141 @@ public class TerminalInstrumentedTest {
         } finally { FileStore.shell("rm -rf " + FileStore.quote(directory), true); }
     }
 
-    @Test public void closingRunningTerminalKillsNonRootChildren() throws Exception {
-        File marker = new File(work, "closing-child.pid");
-        File source = script("close.sh", "sleep 120 &\necho $! > closing-child.pid\nprintf CLOSE_READY\nwait\n");
-        launch(source, false, false); output("CLOSE_READY");
-        String pid = new String(Files.readAllBytes(marker.toPath()), StandardCharsets.US_ASCII).trim();
-        assertTrue(pid.matches("[1-9][0-9]*")); scenario.close(); scenario = null;
-        long deadline = SystemClock.uptimeMillis() + 10000;
-        boolean gone = false;
-        while (SystemClock.uptimeMillis() < deadline) {
-            gone = FileStore.shell("kill -0 " + pid + " 2>/dev/null && echo live || echo gone", false).trim().equals("gone");
-            if (gone) break;
-            SystemClock.sleep(100);
-        }
-        assertTrue("Closing terminal left child process " + pid, gone);
+    @Test public void doubleBackLeavesProcessRunningUntilNaturalExit() throws Exception {
+        File done = new File(work, "continued.txt");
+        File source = script("continue.sh", "printf CONTINUE_READY\n"
+                + "sleep 4\nprintf natural-exit > continued.txt\n");
+        launch(source, false, false); output("CONTINUE_READY");
+        com.termux.terminal.TerminalSession[] child = {null};
+        scenario.onActivity(activity -> child[0] = activity.terminalView().getCurrentSession());
+        device.pressBack(); SystemClock.sleep(150);
+        scenario.onActivity(activity -> assertFalse(activity.isFinishing()));
+        assertFalse(device.hasObject(By.text("停止正在运行的程序？")));
+        device.pressBack();
+        long deadline = SystemClock.uptimeMillis() + 3000;
+        while (scenario.getState() != androidx.lifecycle.Lifecycle.State.DESTROYED && SystemClock.uptimeMillis() < deadline)
+            SystemClock.sleep(30);
+        assertEquals(androidx.lifecycle.Lifecycle.State.DESTROYED, scenario.getState());
+        assertTrue("Returning must keep the PTY child alive", child[0].isRunning());
+        deadline = SystemClock.uptimeMillis() + 10000;
+        while ((!done.exists() || child[0].isRunning()) && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(30);
+        assertTrue(done.exists()); assertFalse(child[0].isRunning());
+        assertEquals("natural-exit", new String(Files.readAllBytes(done.toPath()), StandardCharsets.UTF_8));
+        scenario = null;
     }
+
+    @Test public void recreationReattachesTheSameProcessWithoutExecutingTwice() throws Exception {
+        File source = script("recreate.sh", "printf run >> runs.txt\nprintf RECREATE_READY\nsleep 3\nprintf DONE\n");
+        launch(source, false, false); output("RECREATE_READY");
+        com.termux.terminal.TerminalSession[] before = {null};
+        scenario.onActivity(activity -> before[0] = activity.terminalView().getCurrentSession());
+        scenario.recreate();
+        scenario.onActivity(activity -> assertSame(before[0], activity.terminalView().getCurrentSession()));
+        output("DONE"); output("exit 0");
+        assertEquals("run", new String(Files.readAllBytes(new File(work, "runs.txt").toPath()), StandardCharsets.UTF_8));
+    }
+
+    @Test public void selectionActionsAreChineseAndOutsideTapCancelsSelection() throws Exception {
+        File source = script("selection.sh", "printf 'SELECT_ALPHA SELECT_BETA\\n'; sleep 10\n");
+        launch(source, false, false); output("SELECT_ALPHA");
+        scenario.onActivity(activity -> {
+            ((ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE))
+                    .setPrimaryClip(ClipData.newPlainText("测试", "粘贴测试"));
+            com.termux.view.TerminalView terminal = activity.terminalView();
+            long now = SystemClock.uptimeMillis();
+            MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, 50, 20, 0);
+            terminal.startTextSelectionMode(event); event.recycle();
+            assertTrue(terminal.isSelectingText());
+        });
+        assertNotNull(device.wait(Until.findObject(By.text("复制")), 5000));
+        assertNotNull(device.wait(Until.findObject(By.text("粘贴")), 5000));
+        assertNotNull(device.wait(Until.findObject(By.text("完成")), 5000));
+        assertFalse(device.hasObject(By.text("Copy"))); assertFalse(device.hasObject(By.text("Paste")));
+        scenario.onActivity(activity -> {
+            com.termux.view.TerminalView terminal = activity.terminalView();
+            long now = SystemClock.uptimeMillis();
+            for (int action : new int[]{MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP}) {
+                MotionEvent event = MotionEvent.obtain(now, now + 30, action, 100, action == MotionEvent.ACTION_DOWN ? 100 : 180, 0);
+                terminal.onTouchEvent(event); event.recycle();
+            }
+        });
+        SystemClock.sleep(400);
+        scenario.onActivity(activity -> {
+            assertTrue(activity.terminalView().isSelectingText());
+            try {
+                com.termux.view.TerminalView terminal = activity.terminalView();
+                java.lang.reflect.Field field = com.termux.view.TerminalView.class.getDeclaredField("mTextSelectionCursorController"); field.setAccessible(true);
+                com.termux.view.textselection.TextSelectionCursorController cursor = (com.termux.view.textselection.TextSelectionCursorController) field.get(terminal);
+                int[] selection = new int[4]; cursor.getSelectors(selection);
+                float x = terminal.getPointX(selection[2]) + terminal.mRenderer.getFontWidth() / 2;
+                float y = terminal.getPointY(selection[0]) + terminal.mRenderer.getFontLineSpacing() / 2f;
+                long now = SystemClock.uptimeMillis();
+                for (int action : new int[]{MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP}) {
+                    MotionEvent event = MotionEvent.obtain(now, now + 30, action, x, y, 0);
+                    terminal.onTouchEvent(event); event.recycle();
+                }
+            } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
+        });
+        SystemClock.sleep(400);
+        scenario.onActivity(activity -> assertTrue(activity.terminalView().isSelectingText()));
+        android.graphics.Rect body = device.wait(Until.findObject(By.desc("终端输入与输出")), 5000).getVisibleBounds();
+        device.click(body.centerX(), body.centerY());
+        await(() -> { boolean[] selected = {true}; scenario.onActivity(a -> selected[0] = a.terminalView().isSelectingText()); return !selected[0]; });
+        scenario.onActivity(activity -> {
+            long now = SystemClock.uptimeMillis();
+            MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, 50, 20, 0);
+            activity.terminalView().startTextSelectionMode(event); event.recycle();
+        });
+        click("终端 Ctrl");
+        scenario.onActivity(activity -> assertFalse(activity.terminalView().isSelectingText()));
+        menu("停止"); output("已停止");
+    }
+
+    @Test public void physicalLongPressSelectsAndQuickCopyFinishesSelection() throws Exception {
+        File source = script("physical-selection.sh", "printf 'LONG_PRESS_READY SELECT_WORD\\n'; sleep 20\n");
+        launch(source, false, false); output("LONG_PRESS_READY");
+        UiObject2 view = device.wait(Until.findObject(By.desc("终端输入与输出")), 5000);
+        assertNotNull(view);
+        for (String description : List.of("终端 Esc", "终端 Page Up", "终端 Home", "终端菜单", "终端 Ctrl", "终端输入法")) {
+            android.graphics.Rect key = device.wait(Until.findObject(By.desc(description)), 5000).getVisibleBounds();
+            assertTrue(description, key.width() >= Ui.dp(context, 48));
+            assertTrue(description, key.height() >= Ui.dp(context, 48));
+        }
+        android.graphics.Rect bounds = view.getVisibleBounds();
+        int x = bounds.left + Ui.dp(context, 24), y = bounds.top + Ui.dp(context, 30);
+        device.click(x, y);
+        scenario.onActivity(a -> assertFalse(a.terminalView().isSelectingText()));
+        await(() -> {
+            try { return device.executeShellCommand("dumpsys input_method").contains("mInputShown=true"); }
+            catch (IOException ignored) { return false; }
+        });
+        device.pressBack(); // Hide the input method before testing the selection gesture.
+        await(() -> {
+            try { return !device.executeShellCommand("dumpsys input_method").contains("mInputShown=true"); }
+            catch (IOException ignored) { return false; }
+        });
+        device.swipe(x, y, x, y, 140);
+        await(() -> { boolean[] selected = {false}; scenario.onActivity(a -> selected[0] = a.terminalView().isSelectingText()); return selected[0]; });
+        capture("chinese-selection");
+        String[] copied = {""};
+        scenario.onActivity(a -> copied[0] = a.terminalView().getSelectedText());
+        device.wait(Until.findObject(By.text("复制")), 5000).click();
+        await(() -> { boolean[] selected = {true}; scenario.onActivity(a -> selected[0] = a.terminalView().isSelectingText()); return !selected[0]; });
+        scenario.onActivity(a -> {
+            ClipboardManager clipboard = (ClipboardManager) a.getSystemService(Context.CLIPBOARD_SERVICE);
+            assertEquals(copied[0], clipboard.getPrimaryClip().getItemAt(0).coerceToText(a).toString());
+            com.termux.view.TerminalView terminal = a.terminalView();
+            terminal.stopTextSelectionMode();
+            long now = SystemClock.uptimeMillis();
+            MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, 50, 20, 0);
+            terminal.startTextSelectionMode(event); event.recycle();
+            terminal.stopTextSelectionMode();
+            assertFalse("Explicit actions must work inside the former 300 ms guard", terminal.isSelectingText());
+        });
+        menu("停止"); output("已停止");
+    }
+
+
 
     @Test public void repeatedShortPtyScriptsKeepFinalOutputBeforeExitNotification() throws Exception {
         for (int i = 0; i < 30; i++) {

@@ -118,6 +118,39 @@ public class AppDirectoryIconsInstrumentedTest {
         });
     }
 
+    @Test public void completeBadgeFitsInsideBothRowDensities() {
+        for (boolean comfortable : new boolean[]{false, true}) {
+            context.getSharedPreferences("MainActivity", 0).edit().putBoolean("comfortable", comfortable).commit();
+            scenario.recreate();
+            await(() -> badgeVisible(true, context.getPackageName()) && badgeVisible(false, context.getPackageName()));
+            scenario.onActivity(activity -> {
+                for (String side : List.of("left", "right")) {
+                    ViewGroup list = (ViewGroup) get(get(activity, side), "list");
+                    boolean checked = false;
+                    for (int i = 0; i < list.getChildCount(); i++) {
+                        View row = list.getChildAt(i); Object holder = row.getTag();
+                        if (holder == null) continue;
+                        FileStore.Node node = (FileStore.Node) get(holder, "node");
+                        if (node == null || !node.name.equals(context.getPackageName())) continue;
+                        ImageView badge = (ImageView) get(holder, "appBadge");
+                        android.graphics.Rect visible = new android.graphics.Rect();
+                        assertTrue(badge.getLocalVisibleRect(visible));
+                        assertEquals(badge.getWidth(), visible.width());
+                        assertEquals(badge.getHeight(), visible.height());
+                        assertNotNull(badge.getDrawable());
+                        assertEquals(Ui.dp(activity, comfortable ? 52 : 41), row.getHeight());
+                        checked = true;
+                    }
+                    assertTrue(side, checked);
+                }
+            });
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+            device.waitForIdle();
+            File evidence = new File(context.getExternalFilesDir(null), "badge-complete-" + (comfortable ? "comfortable" : "compact") + ".png");
+            assertTrue(device.takeScreenshot(evidence));
+        }
+    }
+
     private boolean badgeVisible(boolean left, String name) {
         boolean[] visible = {false};
         scenario.onActivity(activity -> {

@@ -9,6 +9,7 @@ import android.widget.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.*;
+import java.lang.ref.WeakReference;
 
 public class ShellActivity extends LabActivity {
     private EditText command, directory, input;
@@ -18,7 +19,10 @@ public class ShellActivity extends LabActivity {
     private View execute, stop, send, eof;
     private ShellRunner runner;
     private volatile ExecutableFile.Prepared script;
-    private boolean preparing, prepareFailed, disposed;
+    private boolean preparing, prepareFailed;
+    private volatile boolean disposed;
+    private long lastBack;
+    private ExecutionFiles executionFiles;
     private boolean pipeMode, autoRun;
     private String generatedCommand, restoredArguments = "";
     private final ExecutorService inputExecutor = Executors.newSingleThreadExecutor();
@@ -45,6 +49,7 @@ public class ShellActivity extends LabActivity {
         body.addView(top, lp(-1, 52));
         LinearLayout location = Ui.row(this);
         directory = Ui.input(this, "工作目录");
+        directory.setContentDescription("工作目录");
         String cwd = getIntent().getStringExtra("cwd");
         directory.setText(cwd == null ? getFilesDir().getAbsolutePath() : cwd);
         location.addView(directory, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
@@ -62,6 +67,7 @@ public class ShellActivity extends LabActivity {
         });
         location.addView(rootMode, lp(88, 48)); body.addView(location);
         command = Ui.input(this, "Shell 命令"); command.setSingleLine(false); command.setMaxLines(4);
+        command.setContentDescription("Shell 命令");
         command.setTypeface(Typeface.MONOSPACE); command.setText("pwd");
         command.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -81,6 +87,7 @@ public class ShellActivity extends LabActivity {
         body.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1)); body.addView(Ui.line(this));
         LinearLayout stdin = Ui.row(this);
         input = Ui.input(this, "标准输入"); stdin.addView(input, new LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1));
+        input.setContentDescription("标准输入");
         send = Ui.icon(this, R.drawable.ic_send, "发送输入", Ui.ACCENT, this::sendInput);
         eof = Ui.icon(this, R.drawable.ic_check, "结束输入", Ui.TEXT, () -> {
             ShellRunner running = runner;
@@ -89,6 +96,7 @@ public class ShellActivity extends LabActivity {
             });
         });
         stdin.addView(send, lp(48, 48)); stdin.addView(eof, lp(48, 48)); body.addView(stdin);
+        ChineseTextActions.install(command, directory, input, output);
         Ui.install(this, body);
         if (saved != null) {
             directory.setText(saved.getString("cwd")); command.setText(saved.getString("command"));
@@ -141,26 +149,36 @@ public class ShellActivity extends LabActivity {
         handler.removeCallbacks(flush);
         synchronized (pending) { pending.setLength(0); scheduled = false; omitted = 0; }
         output.setText(""); status.setText("运行中"); updateControls();
-        Tasks.run(this, Tasks.SHELL, () -> {
-            File log = File.createTempFile("shell-output-", ".txt", getFilesDir());
-            outputLog = log;
-            try (Writer writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(log), StandardCharsets.UTF_8))) {
-                return current.run(text, cwd, useRoot, TimeUnit.MINUTES.toMillis(30), chunk -> {
-                    try { writer.write(chunk); }
-                    catch (IOException e) { throw new UncheckedIOException(e); }
-                    queueOutput(chunk);
-                }, true);
-            }
-        }, result -> {
-            flushOutput(); runner = null; updateControls();
-            status.setText(result.timedOut() ? "运行超时" : result.stopped() ? "已停止" : "exit " + result.exitCode());
-        }, error -> {
-            flushOutput(); runner = null; updateControls(); status.setText("执行失败");
-            queueOutput(error.getMessage() + "\n");
+        ExecutionFiles files = executionFiles = new ExecutionFiles(script);
+        File logs = getFilesDir();
+        WeakReference<ShellActivity> page = new WeakReference<>(this);
+        Tasks.SHELL.execute(() -> {
+            File log = null; ShellRunner.Result result = null; Exception failure = null;
+            try {
+                log = File.createTempFile("shell-output-", ".txt", logs);
+                try (Writer writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(log), StandardCharsets.UTF_8))) {
+                    result = current.run(text, cwd, useRoot, Long.MAX_VALUE, chunk -> {
+                        try { writer.write(chunk); }
+                        catch (IOException e) { throw new UncheckedIOException(e); }
+                        ShellActivity activity = page.get();
+                        if (activity != null) activity.queueOutput(chunk);
+                    }, true);
+                }
+            } catch (Exception error) { failure = error; }
+            finally { files.finished(); }
+            File completedLog = log; ShellRunner.Result completed = result; Exception error = failure;
+            new Handler(Looper.getMainLooper()).post(() -> {
+                ShellActivity activity = page.get();
+                if (activity == null || activity.disposed || activity.runner != current) return;
+                activity.outputLog = completedLog; activity.flushOutput(); activity.runner = null; activity.updateControls();
+                if (error != null) {
+                    activity.status.setText("执行失败"); activity.queueOutput(error.getMessage() + "\n");
+                } else activity.status.setText(completed.timedOut() ? "运行超时" : completed.stopped() ? "已停止" : "exit " + completed.exitCode());
+            });
         });
     }
     private void queueOutput(String chunk) {
-        if (isDestroyed()) return;
+        if (disposed) return;
         synchronized (pending) {
             pending.append(chunk);
             int overflow = pending.length() - 16 * 1024;
@@ -169,6 +187,10 @@ public class ShellActivity extends LabActivity {
         }
     }
     private void flushOutput() {
+        if (disposed) return;
+        if (output.hasSelection() || output.isPressed()) {
+            handler.removeCallbacks(flush); handler.postDelayed(flush, 250); return;
+        }
         String text;
         long dropped;
         handler.removeCallbacks(flush);
@@ -187,8 +209,12 @@ public class ShellActivity extends LabActivity {
         ShellRunner current = runner;
         if (current == null) return;
         String text = input.getText().toString(); input.setText("");
+        WeakReference<ShellActivity> page = new WeakReference<>(this);
         inputExecutor.execute(() -> {
-            try { current.send(text); } catch (IOException e) { queueOutput(e.getMessage() + "\n"); }
+            try { current.send(text); } catch (IOException e) {
+                ShellActivity activity = page.get();
+                if (activity != null) activity.queueOutput(e.getMessage() + "\n");
+            }
         });
     }
     private void stop() {
@@ -204,9 +230,10 @@ public class ShellActivity extends LabActivity {
         command.setEnabled(!running && !preparing && !prepareFailed); directory.setEnabled(!running); rootMode.setEnabled(!running);
     }
     private void leave() {
-        if (runner == null) { finish(); return; }
-        new AlertDialog.Builder(this).setTitle("停止正在运行的命令？").setNegativeButton("继续运行", null)
-                .setPositiveButton("停止并退出", (d, w) -> { stop(); finish(); }).show();
+        long now = SystemClock.uptimeMillis();
+        if (lastBack != 0 && now - lastBack <= 2000) { finish(); return; }
+        lastBack = now;
+        Tasks.toast(this, runner != null ? "再返回一次回到目录，命令继续运行" : "再返回一次回到目录");
     }
     @Override protected void handleBack() { leave(); }
     @Override protected void onSaveInstanceState(Bundle out) {
@@ -219,15 +246,24 @@ public class ShellActivity extends LabActivity {
             out.putString("arguments", text.substring(generatedCommand.length()));
     }
     @Override public void onDestroy() {
-        ShellRunner current = runner;
         ExecutableFile.Prepared old;
         synchronized (this) { disposed = true; old = script; script = null; }
-        Tasks.CONTROL.execute(() -> {
-            if (current != null) current.stop();
-            if (old != null) { try { old.close(); } catch (IOException ignored) {} }
-        });
+        if (executionFiles != null) executionFiles.detach();
+        else Tasks.IO.execute(() -> { if (old != null) try { old.close(); } catch (IOException ignored) { } });
         inputExecutor.shutdownNow();
         handler.removeCallbacks(flush);
         super.onDestroy();
+    }
+    private static final class ExecutionFiles {
+        private final ExecutableFile.Prepared file;
+        private boolean finished, detached, released;
+        ExecutionFiles(ExecutableFile.Prepared file) { this.file = file; }
+        synchronized void finished() { finished = true; release(); }
+        synchronized void detach() { detached = true; release(); }
+        private void release() {
+            if (!finished || !detached || released) return;
+            released = true;
+            Tasks.IO.execute(() -> { if (file != null) try { file.close(); } catch (IOException ignored) { } });
+        }
     }
 }

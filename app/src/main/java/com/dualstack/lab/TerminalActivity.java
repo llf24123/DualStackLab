@@ -13,6 +13,8 @@ import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
 import com.termux.view.TerminalView;
 import com.termux.view.TerminalViewClient;
+import androidx.lifecycle.ViewModel;
+import androidx.lifecycle.ViewModelProvider;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -34,10 +36,23 @@ public class TerminalActivity extends LabActivity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Callbacks callbacks = new Callbacks();
     private final ExecutorService control = Executors.newSingleThreadExecutor();
-    private final Runnable timeout = () -> stopSession();
+    private long lastBack;
+    private TerminalState retained;
+
+    public static final class TerminalState extends ViewModel {
+        TerminalSession session;
+        ExecutableFile.Prepared prepared;
+        File marker, outputLog, logs;
+        String cwd, arguments;
+        boolean root, pipe, stopped;
+        @Override protected void onCleared() {
+            if (session != null) DetachedTerminal.releaseWhenFinished(session, prepared, marker, logs);
+        }
+    }
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        retained = new ViewModelProvider(this).get(TerminalState.class);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
                 | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
         cwd = getIntent().getStringExtra("cwd");
@@ -48,6 +63,9 @@ public class TerminalActivity extends LabActivity {
         FrameLayout display = new FrameLayout(this);
         terminal = new TerminalView(this, null);
         terminal.setTerminalViewClient(callbacks);
+        terminal.setOnCreateContextMenuListener((contextMenu, view, info) -> {
+            contextMenu.add("终端菜单").setOnMenuItemClickListener(item -> { menu(); return true; });
+        });
         terminalTextSize = Math.max(10, Math.min(30,
                 getSharedPreferences("terminal-appearance", 0).getInt("textSize", 13)));
         applyTerminalTextSize();
@@ -91,14 +109,24 @@ public class TerminalActivity extends LabActivity {
         body.setBackgroundColor(Color.BLACK);
         body.getChildAt(0).setBackgroundColor(Color.BLACK);
         blackBars();
-        prepare();
+        if (retained.session != null) {
+            session = retained.session; prepared = retained.prepared; pidFile = retained.marker;
+            outputLog = retained.outputLog; cwd = retained.cwd; arguments = retained.arguments;
+            useRoot = retained.root; pipe = retained.pipe; stopped = retained.stopped;
+            retained.session = null; retained.prepared = null;
+            session.updateTerminalSessionClient(callbacks);
+            terminal.attachSession(session); loading.setVisibility(View.GONE);
+            if (!running()) finished(session);
+        } else if (saved == null) prepare();
+        else loading.setText("原会话已离开此页面，可返回目录；需要重新执行时请使用终端菜单。");
     }
 
     private TextView button(LinearLayout row, String text, String description, Runnable action) {
         TextView key = Ui.text(this, text, 14, 0xffdddddd);
+        key.setSingleLine(true);
         key.setGravity(Gravity.CENTER); key.setContentDescription(description); key.setTooltipText(description);
         key.setClickable(true); key.setFocusable(false);
-        key.setOnClickListener(view -> action.run());
+        key.setOnClickListener(view -> { terminal.stopTextSelectionMode(); action.run(); });
         key.setBackground(new android.graphics.drawable.RippleDrawable(
                 android.content.res.ColorStateList.valueOf(0xff444444), null, null));
         row.addView(key, new LinearLayout.LayoutParams(0, -1, 1));
@@ -129,6 +157,8 @@ public class TerminalActivity extends LabActivity {
     private android.widget.HorizontalScrollView keyScroll(LinearLayout keys) {
         android.widget.HorizontalScrollView scroll = new android.widget.HorizontalScrollView(this);
         scroll.setHorizontalScrollBarEnabled(false);
+        scroll.setFillViewport(true);
+        keys.setMinimumWidth(Ui.dp(this, 7 * 48));
         scroll.addView(keys, new android.widget.FrameLayout.LayoutParams(Math.max(Ui.dp(this, 7 * 48), getResources().getDisplayMetrics().widthPixels), keyHeight()));
         return scroll;
     }
@@ -197,7 +227,6 @@ public class TerminalActivity extends LabActivity {
                     new String[]{"/system/bin/sh", "-c", launch}, environment, 10000, callbacks);
             terminal.attachSession(session);
             loading.setVisibility(View.GONE); terminal.requestFocus();
-            handler.removeCallbacks(timeout); handler.postDelayed(timeout, 30 * 60 * 1000L);
         } catch (Exception error) {
             loading.setText("无法启动终端：" + error.getMessage()); loading.setVisibility(View.VISIBLE);
         }
@@ -220,7 +249,6 @@ public class TerminalActivity extends LabActivity {
     }
     private void finished(TerminalSession finished) {
         if (disposed || finished != session) return;
-        handler.removeCallbacks(timeout);
         int exit = finished.getExitStatus();
         String upstream = "[Process completed" + (exit > 0 ? " (code " + exit + ")" : exit < 0 ? " (signal " + -exit + ")" : "")
                 + " - press Enter]";
@@ -268,11 +296,16 @@ public class TerminalActivity extends LabActivity {
         current.finishIfRunning();
     }
     private void menu() {
+        terminal.stopTextSelectionMode();
         new AlertDialog.Builder(this).setItems(new String[]{"执行设置", "重新执行", "停止", "结束输入", "复制输出", "粘贴", "清屏", "打开输出日志", "关闭"},
                 (dialog, index) -> {
                     switch (index) {
                         case 0 -> settings();
-                        case 1 -> { if (running()) Tasks.toast(this, "请先停止当前进程"); else runFile(); }
+                        case 1 -> {
+                            if (running()) Tasks.toast(this, "请先停止当前进程");
+                            else if (prepared == null) prepare();
+                            else runFile();
+                        }
                         case 2 -> stopSession();
                         case 3 -> { if (running() && !pipe) session.writeCodePoint(false, 4); }
                         case 4 -> copy(terminalText());
@@ -282,7 +315,7 @@ public class TerminalActivity extends LabActivity {
                             if (outputLog == null) { Tasks.toast(this, "进程结束后可打开输出日志"); return; }
                             Intent intent = new Intent(this, EditorActivity.class); FileStore.local(outputLog).put(intent); startActivity(intent);
                         }
-                        case 8 -> handleBack();
+                        case 8 -> finish();
                     }
                 }).show();
     }
@@ -314,24 +347,22 @@ public class TerminalActivity extends LabActivity {
         if (clip != null && clip.getItemCount() > 0) session.getEmulator().paste(clip.getItemAt(0).coerceToText(this).toString());
     }
     @Override protected void handleBack() {
-        if (!running()) { finish(); return; }
-        new AlertDialog.Builder(this).setTitle("停止正在运行的程序？").setNegativeButton("继续运行", null)
-                .setPositiveButton("停止并退出", (dialog, index) -> { stopSession(); finish(); }).show();
+        if (terminal.isSelectingText()) { terminal.stopTextSelectionMode(); return; }
+        long now = SystemClock.uptimeMillis();
+        if (lastBack != 0 && now - lastBack <= 2000) { finish(); return; }
+        lastBack = now;
+        Tasks.toast(this, running() ? "再返回一次回到目录，进程继续运行" : "再返回一次回到目录");
     }
     @Override protected void onDestroy() {
-        handler.removeCallbacks(timeout);
+        handler.removeCallbacksAndMessages(null);
         ExecutableFile.Prepared file;
         synchronized (this) { disposed = true; file = prepared; prepared = null; }
-        File marker = pidFile;
-        TerminalSession current = session;
-        boolean root = useRoot;
-        control.execute(() -> {
-            terminate(current, marker, root);
-            try {
-                if (file != null) file.close();
-                if (marker != null) Files.deleteIfExists(marker.toPath());
-            } catch (Exception ignored) { }
-        });
+        if (isChangingConfigurations() && session != null) {
+            retained.session = session; retained.prepared = file; retained.marker = pidFile;
+            retained.outputLog = outputLog; retained.logs = getFilesDir();
+            retained.cwd = cwd; retained.arguments = arguments;
+            retained.root = useRoot; retained.pipe = pipe; retained.stopped = stopped;
+        } else DetachedTerminal.releaseWhenFinished(session, file, pidFile, getFilesDir());
         control.shutdown();
         super.onDestroy();
     }

@@ -24,7 +24,6 @@ public class OptimizationInstrumentedTest {
     private Context context;
     private File work;
     private FileStore store;
-    private final List<String> backups = new ArrayList<>();
 
     @Before public void setup() throws Exception {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
@@ -34,7 +33,6 @@ public class OptimizationInstrumentedTest {
         work = Files.createTempDirectory(context.getExternalFilesDir(null).toPath(), "optimization-").toFile();
     }
     @After public void cleanup() throws Exception {
-        for (String id : backups) DeletedFiles.purge(context, id);
         store.delete(FileStore.local(work));
     }
     @Test public void measureTransfersAndArchiveReads() throws Exception {
@@ -51,10 +49,8 @@ public class OptimizationInstrumentedTest {
         result.put("moveMs", SystemClock.elapsedRealtime() - start);
         assertEquals(0, copied.list().length); assertEquals(24, moved.list().length);
         start = SystemClock.elapsedRealtime();
-        for (FileStore.Node node : store.list(FileStore.local(moved))) {
-            DeletedFiles.Entry backup = DeletedFiles.recycle(context, node); backups.add(backup.id());
-        }
-        result.put("deleteBackupMs", SystemClock.elapsedRealtime() - start);
+        store.deleteAll(store.list(FileStore.local(moved)));
+        result.put("deleteMs", SystemClock.elapsedRealtime() - start);
         assertEquals(0, moved.list().length);
         File archive = new File(work, "large-directory.zip");
         try (ZipOutputStream zip = new ZipOutputStream(new FileOutputStream(archive))) {
@@ -96,9 +92,11 @@ public class OptimizationInstrumentedTest {
         Object channel = constructor.newInstance(new ProcessBuilder("/system/bin/sh"));
         setStatic(RootDirectoryReader.class, "session", channel);
         try {
+            File parent = new File(work, "parent'quoted|name"); assertTrue(parent.mkdir());
+            assertEquals(parent.getPath(), RootDirectoryReader.nearestDirectory(new File(parent, "missing/deeper").getPath()));
             File source = new File(work, "quoted'pipe|and\nnewline");
             Files.write(source.toPath(), new byte[]{10, 20, 30});
-            FileStore.Node rootNode = Operations.resolve(store, "root:" + source.getPath());
+            FileStore.Node rootNode = store.fromKey("root:" + source.getPath());
             assertEquals(FileStore.local(source).identity, rootNode.identity);
             for (int i = 0; i < 12; i++) try (InputStream input = store.read(rootNode)) {
                 assertArrayEquals(new byte[]{10, 20, 30}, FileStore.readBytes(input, 10));
@@ -108,7 +106,7 @@ public class OptimizationInstrumentedTest {
             File link = new File(context.getCacheDir(), "optimization-link-" + UUID.randomUUID());
             try {
                 Files.createSymbolicLink(link.toPath(), new File(work, "missing").toPath());
-                assertFalse(Operations.resolve(store, "root:" + link.getPath()).identityFollowsLinks);
+                assertFalse(store.fromKey("root:" + link.getPath()).identityFollowsLinks);
             } finally { Files.deleteIfExists(link.toPath()); }
             assertSame(channel, field(RootDirectoryReader.class, null, "session"));
         } finally { RootDirectoryReader.close(); }
@@ -157,6 +155,35 @@ public class OptimizationInstrumentedTest {
             assertArrayEquals(data, Files.readAllBytes(output.file.toPath()));
         } finally { RootAccess.reset(); RootDirectoryReader.close(); RootMutations.close(); }
     }
+    @Test public void archiveMembersStreamIntoReadableRootTargetsWithRealEntrySizes() throws Exception {
+        File archive = new File(work, "root-members.zip"), destination = directory("root-members-out");
+        byte[] payload = new byte[256 * 1024]; new Random(19).nextBytes(payload);
+        try (ZipOutputStream zip = new ZipOutputStream(new FileOutputStream(archive))) {
+            zip.putNextEntry(new ZipEntry("payload.bin")); zip.write(payload); zip.closeEntry();
+            zip.putNextEntry(new ZipEntry("zero.bin")); zip.closeEntry();
+            zip.putNextEntry(new ZipEntry("empty/")); zip.closeEntry();
+        }
+        RootDirectoryReader.close(); RootMutations.close();
+        Class<?> sessionClass = Class.forName("com.dualstack.lab.RootDirectoryReader$Session");
+        java.lang.reflect.Constructor<?> constructor = sessionClass.getDeclaredConstructor(ProcessBuilder.class); constructor.setAccessible(true);
+        setStatic(RootDirectoryReader.class, "session", constructor.newInstance(new ProcessBuilder("/system/bin/sh")));
+        RootMutations.Session mutations = new RootMutations.Session(context, false);
+        setStatic(RootMutations.class, "cached", mutations); setStatic(RootMutations.class, "cachedRoot", true);
+        long now = SystemClock.elapsedRealtime();
+        setStatic(RootAccess.class, "available", true); setStatic(RootAccess.class, "checkedAt", now); setStatic(RootAccess.class, "grantedUntil", now + 30000);
+        try {
+            FileStore.Node source = FileStore.local(archive);
+            List<FileStore.Node> members = List.of(FileStore.archiveNode(source, "payload.bin", false, 0, 0),
+                    FileStore.archiveNode(source, "zero.bin", false, 0, 0), FileStore.archiveNode(source, "empty/", true, 0, 0));
+            FileStore.Node parent = FileStore.local(destination, true);
+            Map<String, Set<String>> names = new HashMap<>(); names.put(parent.key(), new HashSet<>());
+            for (FileStore.Node member : members) store.copy(member, parent, false, names);
+            assertArrayEquals(payload, Files.readAllBytes(new File(destination, "payload.bin").toPath()));
+            assertEquals(0, new File(destination, "zero.bin").length()); assertTrue(new File(destination, "empty").isDirectory());
+            assertSame(mutations, field(RootMutations.class, null, "cached"));
+        } finally { RootAccess.reset(); RootDirectoryReader.close(); RootMutations.close(); }
+    }
+
     @Test public void deviceInventoryOmitsSensorsAndKeepsTwelveCommonProperties() {
         List<DeviceInfo.Field> basic = DeviceInfo.basic(context);
         assertTrue(basic.stream().noneMatch(item -> item.section().equals("传感器") || item.section().equals("系统特性")));
@@ -167,36 +194,7 @@ public class OptimizationInstrumentedTest {
         assertTrue(properties.stream().anyMatch(item -> item.name().equals("ro.build.fingerprint")));
         assertTrue(extra.stream().noneMatch(item -> item.section().equals("完整系统属性")));
     }
-    @Test public void recyclePickerCanSwitchStorageJumpAndSaveExternalBackup() throws Exception {
-        String previous = context.getSharedPreferences("SafRecovery", 0).getString(SafRecovery.BACKUP_DIRECTORY, null);
-        SafRecovery.setBackupDirectory(context, null);
-        UiDevice device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation());
-        try (ActivityScenario<RecycleBinActivity> page = ActivityScenario.launch(RecycleBinActivity.class)) {
-            find(device, By.desc("备份存放目录")).click();
-            find(device, By.text("浏览本地目录")).click();
-            find(device, By.text("内部存储")).click();
-            waitText(device, "本地目录路径", android.os.Environment.getExternalStorageDirectory().getCanonicalPath());
-            find(device, By.text("使用此目录").enabled(true)); device.waitForIdle();
-            device.takeScreenshot(new File(context.getExternalFilesDir(null), "optimization-picker-internal.png"));
-            find(device, By.text("应用私有目录")).click();
-            waitText(device, "本地目录路径", context.getFilesDir().getCanonicalPath());
-            find(device, By.desc("本地目录路径")).click();
-            find(device, By.desc("本地目录跳转输入")).setText(work.getCanonicalPath());
-            find(device, By.text("跳转")).click(); waitText(device, "本地目录路径", work.getCanonicalPath());
-            device.takeScreenshot(new File(context.getExternalFilesDir(null), "optimization-picker.png"));
-            find(device, By.text("使用此目录")).click();
-            assertEquals(work.getCanonicalPath(), find(device, By.desc("备份目录输入")).getText());
-            find(device, By.text("保存")).click();
-            long end = SystemClock.uptimeMillis() + 10000;
-            while (!SafRecovery.backupDirectory(context).getCanonicalFile().equals(work.getCanonicalFile()) && SystemClock.uptimeMillis() < end)
-                Thread.sleep(30);
-            assertEquals(work.getCanonicalFile(), SafRecovery.backupDirectory(context).getCanonicalFile());
-            File source = new File(work, "recycle-source"); Files.write(source.toPath(), new byte[]{7, 8});
-            DeletedFiles.Entry entry = DeletedFiles.recycle(context, FileStore.local(source)); backups.add(entry.id());
-            assertTrue(entry.backup().toPath().startsWith(work.toPath()));
-            assertArrayEquals(new byte[]{7, 8}, Files.readAllBytes(DeletedFiles.restore(context, entry.id()).file.toPath()));
-        } finally { SafRecovery.setBackupDirectory(context, previous == null ? null : new File(previous)); }
-    }
+
     @Test public void fileRowsMatchOriginalGeometry() throws Exception {
         File source = new File(work, "layout.txt"); Files.write(source.toPath(), new byte[]{42});
         SharedPreferences preferences = context.getSharedPreferences("MainActivity", 0);

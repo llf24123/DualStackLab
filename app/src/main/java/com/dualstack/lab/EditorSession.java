@@ -15,6 +15,7 @@ public final class EditorSession extends ViewModel {
     String document, baseline;
     File archive;
     volatile boolean saving;
+    volatile boolean sourceSaved;
     // Main-thread edit generation, independent of EditorDrafts' persistence/clear tokens.
     long contentRevision;
     private final Set<File> temporary = new HashSet<>();
@@ -41,6 +42,7 @@ public final class EditorSession extends ViewModel {
     synchronized void ownParent(File parent) { emptyParents.add(parent); }
     /** Main-thread publication: an IO success only cleans the exact edit generation it captured. */
     boolean saved(long savedRevision, String sourceRevision, long length, PagedTextFile.Page page) throws JSONException {
+        sourceSaved = true;
         baseline = sourceRevision;
         boolean clean = contentRevision == savedRevision;
         EditorDrafts.State state = memory;

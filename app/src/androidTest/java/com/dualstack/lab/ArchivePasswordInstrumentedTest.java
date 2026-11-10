@@ -63,4 +63,24 @@ public class ArchivePasswordInstrumentedTest {
             }
         }
     }
+    @Test public void copyReaderFallsBackForEncryptedZipAndRollsBackWrongPassword() throws Exception {
+        File source = new File(work, "payload.bin"), archive = new File(work, "copy.zip"), output = new File(work, "output");
+        byte[] payload = new byte[32768]; new java.util.Random(21).nextBytes(payload);
+        Files.write(source.toPath(), payload); assertTrue(output.mkdir());
+        ArchiveOps.pack(store, List.of(FileStore.local(source)), archive, "zip", "correct".toCharArray());
+        FileStore.Node member = FileStore.archiveNode(FileStore.local(archive), "payload.bin", false, 0, 0);
+        ArchiveOps.clearPassword(archive);
+        try { store.copy(member, FileStore.local(output), false); fail("Must request a password"); }
+        catch (ArchiveOps.PasswordRequired expected) { assertEquals(0, output.list().length); }
+        ArchiveOps.setPassword(archive, "wrong".toCharArray());
+        try { store.copy(member, FileStore.local(output), false); fail("Must reject wrong password"); }
+        catch (IOException expected) { assertEquals(0, output.list().length); }
+        ArchiveOps.setPassword(archive, "correct".toCharArray());
+        try (ArchiveOps.ReadSession reader = new ArchiveOps.ReadSession(archive); InputStream input = reader.open("payload.bin")) {
+            assertEquals(payload.length, reader.size("payload.bin")); assertArrayEquals(payload, input.readAllBytes());
+        }
+        FileStore.Node copied = store.copy(member, FileStore.local(output), false);
+        assertArrayEquals(payload, Files.readAllBytes(copied.file.toPath()));
+        ArchiveOps.clearPassword(archive);
+    }
 }

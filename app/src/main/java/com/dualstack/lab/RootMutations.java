@@ -28,6 +28,40 @@ final class RootMutations {
     static FileStore.Node create(Context context, FileStore.Node parent, String name, boolean directory) throws IOException {
         return node(call(context, RootFileOps.Request.create(directorySpec(parent), name, directory)));
     }
+    static void writeEmpty(Context context, FileStore.Node target, InputStream payload, long size) throws IOException {
+        RootFileOps.Spec targetSpec = new RootFileOps.Spec(target.path(), target.identity, target.parentIdentity, null, false);
+        RootFileOps.Result result = call(context, RootFileOps.Request.writeEmpty(targetSpec, size), true, payload);
+        if (result == null || !Objects.equals(target.identity, result.identity) || !Objects.equals(target.parentIdentity, result.parentIdentity))
+            throw new IOException("新文件写入返回了不同的目标身份");
+    }
+    static FileStore.Node createShared(FileStore.Node parent, String name, boolean directory) throws IOException {
+        requireWorker();
+        if (!StorageNavigation.appManagedStorage(parent.file)) throw new IOException("目标不是应用可写的共享存储");
+        return node(RootFileOps.createShared(RootFileOps.Request.create(sharedDirectorySpec(parent), name, directory)));
+    }
+    static FileStore.Node moveShared(FileStore.Node source, FileStore.Node parent, String name) throws IOException {
+        requireWorker();
+        FileStore.Node sourceParent = FileStore.directory(source.file.getParentFile(), true);
+        sourceParent.directoryIdentity = source.parentIdentity;
+        if (!StorageNavigation.appManagedStorage(sourceParent.file) || !StorageNavigation.appManagedStorage(parent.file))
+            throw new IOException("移动路径不是应用可写的共享存储");
+        String[] observed = source.identityFollowsLinks
+                ? RootDirectoryReader.identities(sourceParent.path(), parent.path(), source.path())
+                : RootDirectoryReader.identities(sourceParent.path(), parent.path());
+        RootFileOps.Spec fromParent = sharedDirectorySpec(sourceParent, observed[0]), toParent = sharedDirectorySpec(parent, observed[1]);
+        String sourceIdentity = source.identityFollowsLinks ? observed[2] : RootDirectoryReader.stat(source.path(), "%d:%i", false);
+        if (source.identity != null && !source.identity.equals(sourceIdentity)) throw new IOException("移动来源在操作前已变化");
+        RootFileOps.Spec from = new RootFileOps.Spec(source.path(), sourceIdentity, fromParent.directoryIdentity, source.directoryIdentity, source.identityFollowsLinks);
+        return node(RootFileOps.moveShared(RootFileOps.Request.rename(from, toParent, name, true)), source);
+    }
+    private static RootFileOps.Spec sharedDirectorySpec(FileStore.Node directory) throws IOException {
+        return sharedDirectorySpec(directory, RootDirectoryReader.stat(directory.path(), "%d:%i", true));
+    }
+    private static RootFileOps.Spec sharedDirectorySpec(FileStore.Node directory, String observed) throws IOException {
+        String expected = directory.directoryIdentity != null ? directory.directoryIdentity : directory.identity;
+        if (expected != null && !expected.equals(observed)) throw new IOException("共享目录在操作前已变化");
+        return new RootFileOps.Spec(directory.path(), null, null, observed, true);
+    }
     static FileStore.Node rename(Context context, FileStore.Node source, FileStore.Node parent, String name) throws IOException {
         return node(call(context, RootFileOps.Request.rename(spec(source), directorySpec(parent), name, false)), source);
     }
@@ -89,6 +123,9 @@ final class RootMutations {
         return call(context, request, true);
     }
     private static RootFileOps.Result call(Context context, RootFileOps.Request request, boolean root) throws IOException {
+        return call(context, request, root, null);
+    }
+    private static RootFileOps.Result call(Context context, RootFileOps.Request request, boolean root, InputStream payload) throws IOException {
         // Do not let the UI wait on a class monitor held by an IO worker or by su authorization.
         requireWorker();
         synchronized (RootMutations.class) {
@@ -96,7 +133,7 @@ final class RootMutations {
             if (cached != null && (cachedRoot != root || !cached.isAlive() || SystemClock.elapsedRealtime() - cached.created >= LIFETIME_MS)) close();
             try {
                 if (cached == null) { cached = new Session(context.getApplicationContext(), root); cachedRoot = root; }
-                return cached.execute(request, null);
+                return cached.execute(request, null, payload);
             } finally {
                 if (cached != null && !cached.isAlive()) { cached.close(); cached = null; }
                 idle = TIMER.schedule(RootMutations::close, IDLE_MS, TimeUnit.MILLISECONDS);
@@ -134,6 +171,7 @@ final class RootMutations {
         private final AtomicBoolean closed = new AtomicBoolean();
         private final Thread reader, errors;
         private volatile ScheduledFuture<?> timeout;
+        private volatile InputStream activePayload;
 
         Session(Context context, boolean root) throws IOException {
             this(root ? RootShell.command(helperCommand(context))
@@ -175,15 +213,21 @@ final class RootMutations {
             helperPid = pid; helperUid = uid;
         }
 
-        synchronized RootFileOps.Result execute(RootFileOps.Request request, EventHook hook) throws IOException {
+        RootFileOps.Result execute(RootFileOps.Request request, EventHook hook) throws IOException {
+            return execute(request, hook, null);
+        }
+        synchronized RootFileOps.Result execute(RootFileOps.Request request, EventHook hook, InputStream payload) throws IOException {
             requireWorker();
-            byte[] payload = request.encode(); // Serialize completely BEFORE touching the helper's pipe.
+            if (request.operation == RootFileOps.WRITE_EMPTY && payload == null) throw new IOException("写入请求缺少来源流");
+            byte[] requestBytes = request.encode(); // Serialize completely BEFORE touching the helper's pipe.
+            byte[] buffer = request.operation == RootFileOps.WRITE_EMPTY ? new byte[RootFileOps.PAYLOAD_LIMIT] : null;
             if (!isAlive()) throw new IOException("ROOT helper 已关闭；请求未发送");
             boolean prepared = false, cancelling = false;
             IOException callbackFailure = null;
+            activePayload = payload;
             armTimeout();
             try {
-                input.writeInt(payload.length); input.write(payload); input.flush();
+                input.writeInt(requestBytes.length); input.write(requestBytes); input.flush();
                 while (true) {
                     RootFileOps.Event event = next();
                     armTimeout();
@@ -205,23 +249,40 @@ final class RootMutations {
                         case RootFileOps.OK:
                             if (!prepared || cancelling) throw new IOException("ROOT helper 非法 OK 边界");
                             return event.result;
+                        case RootFileOps.READ_PAYLOAD:
+                            if (!prepared || cancelling || buffer == null) throw new IOException("ROOT helper 非法数据请求边界");
+                            int count;
+                            try {
+                                Tasks.Progress.check(); count = payload.read(buffer);
+                                if (count == 0) {
+                                    int single = payload.read(); count = single == -1 ? -1 : 1;
+                                    if (single != -1) buffer[0] = (byte) single;
+                                }
+                                Tasks.Progress.check();
+                            } catch (IOException error) { callbackFailure = error; cancelling = true; count = -2; }
+                            input.writeInt(count);
+                            if (count > 0) input.write(buffer, 0, count);
+                            input.flush();
+                            if (count > 0) Tasks.Progress.bytes(count);
+                            break;
                         case RootFileOps.ERROR:
                             // A complete ERROR terminates exactly one request; it is not a transport retry.
                             throw new RemoteFailure(event.text);
                         case RootFileOps.CANCELLED:
                             if (!prepared || !cancelling) throw new IOException("意外 CANCELLED");
-                            if (callbackFailure != null) throw callbackFailure;
+                            if (callbackFailure instanceof Tasks.CancelledException) throw callbackFailure;
+                            if (callbackFailure != null) throw new SourceFailure(callbackFailure);
                             throw new Tasks.CancelledException();
                         default: throw new IOException("ROOT helper 响应顺序错误");
                     }
                 }
-            } catch (RemoteFailure | Tasks.CancelledException error) {
+            } catch (RemoteFailure | SourceFailure | Tasks.CancelledException error) {
                 throw error;
             } catch (IOException error) {
                 abort(); throw diagnostic(error);
             } catch (RuntimeException error) {
                 abort(); throw new IOException("STEP 回调失败；已关闭会话，绝不重放请求", error);
-            } finally { disarmTimeout(); }
+            } finally { activePayload = null; disarmTimeout(); }
         }
         private RootFileOps.Event next() throws IOException {
             try {
@@ -245,6 +306,13 @@ final class RootMutations {
         }
         private void abort() {
             if (!closed.compareAndSet(false, true)) return;
+            InputStream payload = activePayload; activePayload = null;
+            if (payload != null) {
+                // Closing an Android pipe/source releases a blocked read on the caller. Keep
+                // source-specific close implementations off the protocol watchdog thread.
+                Thread closeSource = new Thread(() -> { try { payload.close(); } catch (IOException ignored) { } }, "root-copy-close-source");
+                closeSource.setDaemon(true); closeSource.start();
+            }
             // Destroy first: a writer blocked on a full pipe must not prevent the timeout thread closing it.
             process.destroy(); if (process.isAlive()) process.destroyForcibly();
             try { process.getOutputStream().close(); } catch (IOException ignored) { }
@@ -269,5 +337,8 @@ final class RootMutations {
         }
     }
     private static final class RemoteFailure extends IOException { RemoteFailure(String message) { super(message); } }
+    private static final class SourceFailure extends IOException {
+        SourceFailure(IOException cause) { super(cause.getMessage(), cause); }
+    }
     private RootMutations() { }
 }

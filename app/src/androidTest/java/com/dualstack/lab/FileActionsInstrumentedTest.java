@@ -124,6 +124,7 @@ public class FileActionsInstrumentedTest {
         assertEquals(before, after);
     }
     @Test public void externalPrivateProviderDescriptorUsesRootForOriginalDirectory() throws Exception {
+        Assume.assumeTrue("Requires a granted su binary", RootAccess.available());
         Uri uri = Uri.parse("content://" + ExternalFixtureProvider.AUTHORITY + "/private");
         ExternalFiles.Received received = ExternalFiles.receive(context, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
         assertNotNull(received.directory()); assertTrue(received.node().root);
@@ -156,7 +157,7 @@ public class FileActionsInstrumentedTest {
         assertFalse(new File(work, "escape.txt").exists());
     }
     @Test public void rootMoveAndPermissionChangePreserveInode() throws Exception {
-        assertEquals("0", FileStore.shell("id -u", true).trim());
+        Assume.assumeTrue("Requires a granted su binary", RootAccess.available());
         File rootWork = new File("/data/local/tmp/dualstack-actions-" + UUID.randomUUID());
         FileStore.shell("mkdir " + FileStore.quote(rootWork.getPath()), true);
         try {
