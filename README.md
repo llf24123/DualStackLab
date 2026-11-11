@@ -2,6 +2,8 @@
 
 Android 双窗口文件管理与 APK 学习研究工具。最低 Android 8.0（API 26），目标 API 36。界面参考 MT 管理器的双列表、路径栏和底部操作栏。
 
+应用**不申请 `INTERNET` 权限**：不上传文件、不做统计、没有账号或授权校验，全部功能本地完成。
+
 ## 当前版本
 
 - 主界面复制、移动和删除直接进入文件工作线程，普通删除为永久删除。任务中心及回收站已移除，复制过程采用静默模式，完成后定位并高亮目标文件。
@@ -112,14 +114,21 @@ Android 双窗口文件管理与 APK 学习研究工具。最低 Android 8.0（A
 
 本次验证环境：Windows、JDK 17、系统 Gradle 9.8.1、Android SDK Platform 36、SDK Build Tools 36.1.0、AGP 9.1.1。
 
-项目使用系统 Gradle，没有附带 Gradle Wrapper。依赖首次下载需要联网；仓库地址配置在 `settings.gradle`。
+仓库自带 Gradle Wrapper（`gradlew` / `gradlew.bat`，锁定 Gradle 9.8.1），不需要本机安装 Gradle。依赖首次下载需要联网；仓库地址配置在 `settings.gradle`。
 
-在项目根目录用 PowerShell 执行：
+在项目根目录执行（Windows PowerShell）：
 
 ```powershell
-# 替换为本机的 Android SDK 目录；已经配置时无需重复设置。
+# 替换为本机的 Android SDK 目录；已经配置 ANDROID_HOME 时无需重复设置。
 $env:ANDROID_HOME = 'C:\path\to\Android\Sdk'
-gradle assembleDebug lintDebug
+.\gradlew.bat assembleDebug lintDebug
+```
+
+Linux / macOS：
+
+```bash
+export ANDROID_HOME="$HOME/Android/Sdk"
+./gradlew assembleDebug lintDebug
 ```
 
 也可以在 Android Studio 中打开项目根目录，由 IDE 配置本机 SDK。源码包不包含 `local.properties`。
@@ -151,7 +160,7 @@ app/build/outputs/apk/debug/app-debug.apk
 连接 Android 测试设备或启动模拟器，然后执行：
 
 ```powershell
-gradle connectedDebugAndroidTest
+.\gradlew.bat connectedDebugAndroidTest
 ```
 
 测试依赖 AndroidX Test 和 UI Automator，会创建测试文件并操作应用界面，使用专用测试设备。源码包含 165 项 instrumentation 测试，覆盖文件、SAF、ZIP、APK 资源、DEX、签名、编码、分页、刷新、Shell、ELF、书签、主题、主窗口归档和预览。保留 0.6.1 的五项真实 ROOT 测试。0.6.2 增加十一项终端测试，验证未知编码和二进制尾部、Unicode 脚本、真实 PTY、中文 IME 输入、回车关闭、ELF ANSI/方向键/Ctrl-C、参数/管道、ROOT 子进程清理、受限 `/data/adb` 脚本、ROOT ELF、横竖屏/主题、直接关闭运行中的终端、连续 30 次短脚本和超出队列容量的 2500 行输出排空，以及 256 KiB 粘贴在程序不读取标准输入时仍可停止。0.6.3 增加十一项交互测试，覆盖恢复目录的系统返回、双次退出、二列长按菜单的复制/重命名/书签、单窗口复制/多选移动、浅深色/横屏、外部 VIEW/SEND/ZIP/文件流回退、重复外部 Intent/重建、真实双指缩放与会话输入保留、字号上下限和保存。0.6.5 增加十项回归，覆盖短 Unicode 和未知字节、合法与非法分页尾部、Android/data 自动 ROOT 与旧书签、直接节点读写和 ZIP 原包回写、完整路径复制和编辑保存；ISO-2022 大文件测试加入自动前缀识别检查。0.6.6 增加十项，覆盖双窗阴影、侧滑多选与范围选择、边缘滚动、刷新手势兼容、控制字符和字节保留。其中外部样本测试通过 `samplePath` 和 `sampleSha256` 参数读取副本，未提供时使用生成的全字节范围样例，不内置用户文件。0.6.7 增加四项，覆盖私有应用目录完整列表、全局视图文件读写及工作目录、su 参数兼容和关键容器删除保护、实际界面进入和编辑及页面重建。0.6.8 增加十二项，覆盖超过 4 MiB 的普通和管道脚本、CRLF/CR 与 UTF-8 BOM、UTF-16/32 大脚本、有二进制尾部与未知编码的脚本、损坏编码失败清理、跨缓冲区换行、257 MiB ELF、ROOT 与受限 `/data/adb` 大脚本读取执行、8 MiB 脚本和 12 MiB ELF 的 PTY 输入。0.6.9 增加十五项，覆盖本地/ROOT 移动 inode 保留与同名避让、跨卷移动内容、文件/目录权限及无效八进制、符号链接保护、独立提供方实际描述符目录定位与管道 URI 不导入、全包/选中项解压和失败清理，以及对应实际 UI 操作。0.6.10 增加十项，使用自制无害原生程序检查原文件/副本启动、自身路径与参数、无执行位回退、明确错误不重复运行、受限目录与归档、带 .sh 后缀的大 ELF 字节保留、管道偏好下仍可 PTY 中文输入及启动方式选择界面。测试程序的四种 ABI 仅打入测试 APK，源码在 `work/elf-compat-0610/executable-probe.c`，重建使用同目录 `BuildProbe.ps1`。无 su 时原有真实 ROOT 测试会跳过；交付的完整回归要求全部通过且不跳过。真实目录完整性对比使用 Magisk 的 `su -M`，需要相应测试环境。安装测试使用自制无代码 APK，不安装用户提供的未知 APK。交付结果详见本版本独立复核报告与证据包。
@@ -210,3 +219,26 @@ gradle connectedDebugAndroidTest
 RAR 读取依赖 Junrar 8.1.2，许可文本保存在 `third_party/licenses/JUNRAR-LICENSE.txt`；归档样例来源和校验用途见 instrumentation assets 的说明。
 
 依赖版本以 `app/build.gradle` 为准，包括 AndroidX Activity、SwipeRefreshLayout、juniversalchardet、Sora Editor、Zip4j、ARSCLib、smali/baksmali、apksig 和 desugar_jdk_libs。Termux 终端基于固定提交 `8629e632fcb95da272221be327db653fb24befe9`：terminal-view 使用未修改 release AAR，terminal-emulator Java 源码在本地 library module 编译，修改 PTY 描述符管理和结束排空顺序，原生库保持上游版本。上游 AAR、完整源码与许可文本保存在 `third_party/termux/`，具体改动见该目录 `NOTICE.md`。原生 64 位 ELF LOAD 段与 APK ZIP 均检查 16 KB 对齐，但尚未在 ARM 16 KB 实机验证。研究、修改或分发依赖时，应保留各项目要求的许可声明。
+
+## 许可证
+
+本项目以 **GNU General Public License v3.0** 发布，全文见 [`LICENSE`](LICENSE)。
+
+选 GPL-3.0 的两个理由：本项目的 `terminal-emulator` 源码派生自 Termux（上游 GPL-3.0-only，两个 terminal 模块为 Apache-2.0 例外），且静态链接了 LGPL-2.1 的 Sora Editor——整体按 GPL-3.0 发布是合规路径最短的一种。若你希望改成 Apache-2.0 或 MIT，需要先评估 LGPL 静态链接与 UnRAR 条款，不要直接替换 `LICENSE` 文件。
+
+## 第三方组件与许可
+
+| 组件 | 版本 | 许可 | 许可文本 |
+|---|---|---|---|
+| AndroidX Activity / SwipeRefreshLayout | 1.10.1 / 1.2.0 | Apache-2.0 | 依赖内 |
+| Termux terminal-view / terminal-emulator | 8629e632fc | Apache-2.0（上游例外条款） | `third_party/termux/Apache-2.0.txt`、`GPL-3.0.txt` |
+| juniversalchardet | 2.5.1 | MPL-1.1 / GPL / LGPL 三选一 | 依赖内 |
+| Sora Editor（editor / language-java / language-textmate） | 0.24.6 | LGPL-2.1 | 依赖内 |
+| zip4j | 2.11.5 | Apache-2.0 | 依赖内 |
+| junrar | 8.1.2 | UnRAR 限制条款 | `third_party/licenses/JUNRAR-LICENSE.txt` |
+| ARSCLib | 1.4.0 | Apache-2.0 | 依赖内 |
+| smali / baksmali | 2.5.2 | BSD-3-Clause | 依赖内 |
+| apksig | 8.9.0 | Apache-2.0 | 依赖内 |
+| desugar_jdk_libs | 2.1.5 | GPL-2.0 with Classpath Exception | 依赖内 |
+
+> junrar 的 UnRAR 条款限制"基于其源码开发 RAR 压缩程序"，与本项目的只读解压用途一致；分发时保留原文即可。
